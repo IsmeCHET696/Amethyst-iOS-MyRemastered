@@ -47,7 +47,7 @@ static const CGFloat kDragThreshold = 10.0;
         self.userInteractionEnabled = YES;
         // 默认显示 FPS/内存标签（可通过菜单开关）
         _statsLabelVisible = YES;
-        _overlayHidden = NO;
+        _overlayHidden = YES;
 
         // 从偏好加载 FPS/内存显示开关状态
         NSNumber *savedVisible = getPrefObject(kPrefStatsLabelVisible);
@@ -81,7 +81,7 @@ static const CGFloat kDragThreshold = 10.0;
     // 使用纯 frame 布局（不用 auto layout），因为按钮位置通过 center 手动设置并持久化
     // 不设置 translatesAutoresizingMaskIntoConstraints = NO，保持默认 YES，避免无约束导致 frame 不确定
     // 确保按钮能响应触摸
-    self.menuButton.userInteractionEnabled = YES;
+   // self.menuButton.userInteractionEnabled = YES;
 
     // 添加拖拽手势
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuButtonPan:)];
@@ -89,8 +89,8 @@ static const CGFloat kDragThreshold = 10.0;
     [self.menuButton addGestureRecognizer:pan];
 
     // 点击事件
-    [self.menuButton addTarget:self action:@selector(menuButtonTouchedDown:) forControlEvents:UIControlEventTouchDown];
-    [self.menuButton addTarget:self action:@selector(menuButtonTouchedUp:) forControlEvents:UIControlEventTouchUpInside];
+   // [self.menuButton addTarget:self action:@selector(menuButtonTouchedDown:) forControlEvents:UIControlEventTouchDown];
+   // [self.menuButton addTarget:self action:@selector(menuButtonTouchedUp:) forControlEvents:UIControlEventTouchUpInside];
 
     [self addSubview:self.menuButton];
 }
