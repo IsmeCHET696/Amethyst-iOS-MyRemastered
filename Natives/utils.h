@@ -199,3 +199,11 @@ void CallbackBridge_pauseGameIfNeed();
 // 由 KeyboardInput.m 在物理键盘按下/释放事件中调用。
 void CallbackBridge_syncModifiersToMC(int mods);
 void CallbackBridge_queueModifierSync(int mods);
+
+// ---- Air 对齐：gl_bridge.m 实现的取证/呈现层接口（见 gl_bridge.m 内定义）----
+void ame_egl_swap_stats(unsigned long *ok, unsigned long *fail);
+void ame_egl_swap_framegap(unsigned int *maxGapMs, unsigned int *avgGapMs);
+void ame_egl_swap_phase_stats(unsigned int *presentAvgMs, unsigned int *presentMaxMs,
+                              unsigned int *buildAvgMs, unsigned int *buildMaxMs);
+bool ame_gl_surface_owns_layer(void);
+bool ame_gl_surface_transposed(void);

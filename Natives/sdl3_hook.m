@@ -344,6 +344,10 @@ static bool ame_shouldReusePrimaryWindow(void) {
 // 不走 SDL 属性 API（SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER 的字符串值随版本可能
 // 变动），改为直接遍历层级匹配类名 —— SDL 的视图已被启动器嵌进宿主 view，
 // 一定在同一棵树上，不依赖任何 SDL 符号。
+// Air Task52 对齐：嵌入宿主后的 SDL 视图引用（供 gl_bridge 的可见性/z 序
+// 守卫做同一性比较）。只保存不持有（__bridge 裸指针语义由访问器提供）。
+static UIView *ame_embeddedSDLView = NULL;
+
 static UIView *ame_findSDLView(UIView *from) {
     Class sdlClass = NSClassFromString(@"SDL_uikitview");
     if (sdlClass == nil || from == nil) return nil;
@@ -1547,6 +1551,7 @@ static void ame_syncReusedWindowSize(void *window, int w, int h, bool pushEvent)
     // EGL surface 的像素尺寸）更容易被判为越界，进而触发 SDL 清除 mouse->focus
     // —— 即 ZL2 注释里提到的「虚拟鼠标坐标超过 SDL window 尺寸」问题。
     UIView *sdlView = ame_findSDLView(gsv);
+    if (sdlView != nil) ame_embeddedSDLView = sdlView;
     if (sdlView != nil) {
         if (gsv != nil && gsv.bounds.size.width > 0.0) {
             CGRect full = CGRectMake(0.0, 0.0,
@@ -3103,4 +3108,10 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
 /// MobileGL 在老路径上仍走已验证可用的 desktop GL 3.3 Core 上下文。
 bool amethyst_sdl3_wants_gles_context(void) {
     return ame_sdl3WantsGles && ame_glBridgeEnabled();
+}
+
+// Air Task52 对齐：向 gl_bridge.m 暴露嵌入的 SDL 视图（同一性比较用，
+// 不得解引用为 ARC 对象持有）。
+void *ame_hook_getEmbeddedSDLView(void) {
+    return (__bridge void *)ame_embeddedSDLView;
 }
