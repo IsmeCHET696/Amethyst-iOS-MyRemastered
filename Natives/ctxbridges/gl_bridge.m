@@ -12,6 +12,19 @@
 #include "gl_bridge.h"
 #include "utils.h"
 
+// ---------------------------------------------------------------------------
+// 兼容垫片：Amethyst_SDL3SurfaceWantsPoints()
+//
+// Air Task 60（664f58a3）已定案：本函数代表的「1x 点数对齐」（Task 50）退役，
+// 恒返回 NO 让 1x 分支全部走不通（Air 侧连函数都已删除）。本仓库历史上由
+// sdl3_hook / SurfaceViewController 引用过它，为免对齐 Air 的 gl_bridge 后
+// 出现未定义符号，这里保留一个恒 NO 的导出实现；当前唯一调用点已按 Air
+// 移除，保留它只是 ABI 保险，不改变任何行为。
+// ---------------------------------------------------------------------------
+BOOL Amethyst_SDL3SurfaceWantsPoints(void) {
+    return NO;
+}
+
 static EGLDisplay g_EglDisplay;
 static egl_library handle;
 

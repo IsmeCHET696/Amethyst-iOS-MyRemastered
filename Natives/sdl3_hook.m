@@ -30,7 +30,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import "utils.h"
-extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
 extern CALayer *Amethyst_SDL3RenderLayer(void);
 static void ame_applyLauncherResolutionToSDLLayer(void);
 
@@ -1046,7 +1045,9 @@ static void ame_maybeNudgeWindowResize(void) {
     // 单一事实源（MC 以「点」渲染，surface 就是点尺寸）。本 nudge 以物理像素
     // 为判据，与之直接冲突——它会持续把 MC 的 viewport 往 2436x1125 推，而
     // 1x 对齐要求保持 812x375，二者每帧拉锯。Air 没有此机制，对齐期间停用。
-    if (Amethyst_SDL3SurfaceWantsPoints()) return;
+    // Air Task 60（664f58a3）定案：1x 点数对齐（Task 50）已退役，
+    // Amethyst_SDL3SurfaceWantsPoints() 恒为 NO —— 本守卫随之成为死代码，
+    // 与 Air 的 sdl3_hook 对齐后一并移除（Air 侧无此调用点）。
     if (ame_resizeNudgeBudget <= 0) return;
     ame_swapFrames++;
     // 第 1 帧放行（管线首轮未完成），此后逐帧检查。
