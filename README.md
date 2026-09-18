@@ -128,6 +128,7 @@ JIT (Just-In-Time compilation) is essential for smooth gameplay. Choose the appr
 - [@LanRhyme](https://github.com/LanRhyme) -- ShardLauncher author; iOS 26 compatibility and logging improvements
 - [@WeiErLiTeo](https://github.com/WeiErLiTeo) -- Mod download integration, TouchController optimizations, and two-finger long-press keyboard trigger
 - [@Li2548](https://github.com/Li2548) -- Upstream synchronization
+- [@Gsjsjzhznsz](https://github.com/Gsjsjzhznsz) -- Air launcher author; SDL3 presentation adaptations, Minecraft 26.3 black-screen (FBO0 heal blit) and resolution self-healing fixes, MobileGlues deadlock fix, Zink OpenGL bridge
 
 ## About Translations
 
