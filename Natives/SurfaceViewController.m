@@ -1444,6 +1444,27 @@ static UIView *findSDL_uikitview(UIView *root);
     [self updateControlHiddenState:NO];
 }
 
+// Task87：LTW × MC 26.x 兼容性预检 ------------------------------------------
+// LTW 在 iOS 上把桌面 GL 3.3 转译到 Apple 系统 ANGLE 的 GLES 3.0
+// （日志实证 "LTW: Running on OpenGL ES 3.0 with ESSL 300"），且 LTW 无纹理
+// 缓冲（TBO）模拟层。而 MC 26.x 的云渲染管线（minecraft:core/rendertype_clouds）
+// 在桌面 GL 3.3 下按核心规范使用 samplerBuffer（TBO 自 GL 3.1 起为核心特性）
+// ——ES 3.0 后端没有 GL_EXT_texture_buffer，着色器编译死于
+// "'samplerBuffer' : Illegal use of reserved word" → 资源重载阶段必崩在标题界面。
+// Zink（桌面 GL 4.x 全量）与 MobileGlues（自带 TBO 模拟）不受影响。
+// 版本口径复用 ame98_mcMajorFromVersionId（JavaLauncher.h 导出），与 ResolveLwjglVersion
+// 共用同一实现，Fabric/NeoForge/Forge 前缀形态 ID 也不会漏判。
+static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
+    if (mcVersionId.length == 0) {
+        return NO;
+    }
+    NSInteger major = ame98_mcMajorFromVersionId(mcVersionId);
+    if (major <= 0) {
+        return NO;
+    }
+    return major >= 26;
+}
+
 - (void)launchMinecraft {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         // Validate metadata first
@@ -1463,6 +1484,20 @@ static UIView *findSDL_uikitview(UIView *root);
             windowHeight = 720;
         }
         
+        // Task87：LTW 渲染器 × MC 26.x 预检（渲染器能力缺口，见 ame87_mcVersionRequiresTextureBuffer 头注释）
+        NSString *ame87_renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        NSString *ame87_versionId = [self.metadata[@"id"] description];
+        if ([ame87_renderer isEqualToString:@ RENDERER_NAME_LTW]
+            && ame87_mcVersionRequiresTextureBuffer(ame87_versionId)) {
+            NSLog(@"[SurfaceViewController] Task87 launch gate: LTW renderer + MC %@ blocked -- GL 3.3 requires texture buffers for the 26.x clouds pipeline, LTW's iOS backend is GLES 3.0 without GL_EXT_texture_buffer; startup would crash at the title screen", ame87_versionId);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self dismissLaunchOverlayOnError];
+                showDialog(localize(@"Error", nil),
+                    [NSString stringWithFormat:@"LTW 渲染器不支持 MC %@：\n\n26.x 的云渲染管线需要纹理缓冲（samplerBuffer），而 LTW 在 iOS 上的 ES 3.0 后端无法提供，启动后必崩在标题界面。\n\n请到 设置 → 视频设置 → 渲染器 切换到 Zink 或 MobileGlues 后重试。LTW 仍可用于 1.21.x 及更早版本。", ame87_versionId]);
+            });
+            return;
+        }
+
         // Get Java version
         int minVersion = [self.metadata[@"javaVersion"][@"majorVersion"] intValue];
         if (minVersion == 0) {
