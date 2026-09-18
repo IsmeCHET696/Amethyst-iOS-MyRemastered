@@ -112,7 +112,10 @@ MOBILEGL_SOURCE_DIR   ?= $(SOURCEDIR)/Natives/external/MobileGL
 # 两个后端 dylib 已提交在 Natives/resources/Frameworks/ 下，日常构建直接用它，
 # 不必重编（编 glslang + SPIRV-Cross 约 30 分钟，Actions 对 macOS 按 10 倍计费）。
 # 改源码时才用 BUILD_MOBILEGL=1 重开。
-# 更新源码：Actions -> Vendor MobileGL sources -> Run workflow
+# 更新源码：直接用 git 把 MobileGL-Dev/MobileGL 的 dev 分支（子模块取各自默认
+# 分支）同步进 Natives/external/MobileGL，并保持既有剔除规则（SPIRV-Cross/test、
+# glslang/Test、Vulkan-Headers/tests、DiligentCore/Samples|Tutorials、
+# trace_replay/fixtures、android-plugin）。不依赖任何 workflow。
 BUILD_MOBILEGL        ?= 0
 MOBILEGL_DYLIB        ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMobileGL.dylib
 MOBILEGL_GLES_DYLIB   ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMobileGL-gles.dylib
