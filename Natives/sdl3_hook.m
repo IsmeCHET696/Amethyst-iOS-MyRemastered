@@ -73,6 +73,11 @@ typedef void *(*ame_fn_SDL_CreateWindow)(const char *title, int w, int h, uint32
 typedef void *(*ame_fn_SDL_CreateWindowWithProperties)(uint32_t props);
 typedef void (*ame_fn_SDL_DestroyWindow)(void *window);
 typedef bool (*ame_fn_SDL_SetWindowSize)(void *window, int w, int h);
+// Air Task 32/51/67 移植：窗口生命周期与键盘态轮询钩子签名
+typedef bool (*ame_fn_SDL_HideWindow)(void *window);
+typedef bool (*ame_fn_SDL_SetWindowPosition)(void *window, int x, int y);
+typedef bool (*ame_fn_SDL_SetWindowFullscreen)(void *window, bool fullscreen);
+typedef const bool *(*ame_fn_SDL_GetKeyboardState)(int *numkeys);
 typedef bool (*ame_fn_SDL_GetWindowSize)(void *window, int *w, int *h);
 typedef long long (*ame_fn_SDL_GetNumberProperty)(uint32_t props, const char *name,
                                                   long long default_value);
@@ -125,6 +130,10 @@ static ame_fn_SDL_CreateWindow ame_real_CreateWindow = NULL;
 static ame_fn_SDL_CreateWindowWithProperties ame_real_CreateWindowWithProperties = NULL;
 static ame_fn_SDL_DestroyWindow ame_real_DestroyWindow = NULL;
 static ame_fn_SDL_SetWindowSize ame_real_SetWindowSize = NULL;
+static ame_fn_SDL_HideWindow ame_real_HideWindow = NULL;
+static ame_fn_SDL_SetWindowPosition ame_real_SetWindowPosition = NULL;
+static ame_fn_SDL_SetWindowFullscreen ame_real_SetWindowFullscreen = NULL;
+static ame_fn_SDL_GetKeyboardState ame_real_GetKeyboardState = NULL;
 static ame_fn_SDL_GetWindowSize ame_real_GetWindowSize = NULL;
 static ame_fn_SDL_GetNumberProperty ame_real_GetNumberProperty = NULL;
 static ame_fn_SDL_LoadFunction ame_real_LoadFunction = NULL;
@@ -1237,6 +1246,118 @@ static bool ame_SDL_ShowWindow(void *window) {
     return r;
 }
 
+#pragma mark - Air Task 32/51/67 移植：窗口生命周期钩子（尺寸钳制 + 取证）
+
+// Air Task51 Fix E：Pojav/Java 侧以"像素"语义调 SDL_SetWindowSize（如 2436x1125），
+// 而 SDL3-on-iOS 是"点"语义（iPhone X 横屏 812x375 点）。超屏的 SDL 窗口会把
+// 嵌入的 SDL_uikitview 拉成像素量级并带负偏移，ANGLE 表面随之被锁死成错误尺寸，
+// present 纹理与 drawable 失配 —— 表现为黑屏 / 画面缩在角落 / 必须手动改一次
+// 分辨率才恢复。钳制规则：宽或高超过屏幕点数则折半（像素→点），仍超则硬钳屏幕点数。
+static CGSize ame51_display_pts(void) {
+    static CGSize pts = {0, 0};
+    if (pts.width <= 0 || pts.height <= 0) {
+        CGFloat w = 0, h = 0;
+        @try {
+            CGRect b = [UIScreen mainScreen].bounds;   // 线程安全属性
+            w = b.size.width; h = b.size.height;
+        } @catch (NSException *e) {
+            NSLog(@"[SDLHook] Task51 mainScreen bounds exception: %@", e);
+        }
+        if (w <= 0 || h <= 0) {            // 异常兜底
+            w = 1180; h = 820;
+        }
+        // UIScreen 返回竖屏口径时翻成横屏口径（Info.plist 已锁横屏）
+        if (w < h) { CGFloat t = w; w = h; h = t; }
+        pts = CGSizeMake(w, h);
+        NSLog(@"[SDLHook] Task51 display pts cached: %.0fx%.0f", pts.width, pts.height);
+    }
+    return pts;
+}
+
+static bool ame_SDL_SetWindowSize(void *window, int w, int h) {
+    int cw = w, ch = h;
+    if (w > 0 && h > 0) {
+        CGSize pts = ame51_display_pts();
+        int maxW = (int)pts.width, maxH = (int)pts.height;
+        if (maxW > 0 && maxH > 0 && (w > maxW || h > maxH)) {
+            cw = (w > maxW) ? (w / 2) : w;   // 像素语义折半 = 点语义
+            ch = (h > maxH) ? (h / 2) : h;
+            if (cw > maxW) cw = maxW;
+            if (ch > maxH) ch = maxH;
+            NSLog(@"[SDLHook] Task51 SetWindowSize pixel->point clamp: %dx%d -> %dx%d (display %dx%d pts)",
+                  w, h, cw, ch, maxW, maxH);
+        }
+    }
+    if (ame_real_SetWindowSize == NULL) {
+        ame_real_SetWindowSize =
+            (ame_fn_SDL_SetWindowSize)ame_real_dlsym("SDL_SetWindowSize");
+    }
+    bool r = ame_real_SetWindowSize ? ame_real_SetWindowSize(window, cw, ch) : false;
+    // 尺寸已变：SDL 内部 points 与缓存的 EGL surface 尺寸都可能过期
+    ame_sdlPointCacheInvalidate();
+    ame_surfCacheInvalidate();
+    NSDebugLog(@"[SDLHook] SDL_SetWindowSize(%p, %d, %d) -> %d", window, cw, ch, (int)r);
+    return r;
+}
+
+static bool ame_SDL_SetWindowPosition(void *window, int x, int y) {
+    int cx = x, cy = y;
+    if (x < 0 || y < 0) {
+        // Air Task51：超屏窗口（像素语义）居中产生的负偏移会把嵌入的 SDL 视图
+        // 坐标系拖离屏幕原点 → 触摸命中区域错位。钳回 (0,0)。
+        if (cx < 0) cx = 0;
+        if (cy < 0) cy = 0;
+        NSLog(@"[SDLHook] Task51 SetWindowPosition clamp: %d,%d -> %d,%d", x, y, cx, cy);
+    }
+    bool r = ame_real_SetWindowPosition ? ame_real_SetWindowPosition(window, cx, cy) : false;
+    NSDebugLog(@"[SDLHook] SDL_SetWindowPosition(%p, %d, %d) -> %d", window, cx, cy, (int)r);
+    return r;
+}
+
+static bool ame_SDL_HideWindow(void *window) {
+    bool r = ame_real_HideWindow ? ame_real_HideWindow(window) : false;
+    NSDebugLog(@"[SDLHook] SDL_HideWindow(%p) -> %d", window, (int)r);
+    return r;
+}
+
+static bool ame_SDL_SetWindowFullscreen(void *window, bool fullscreen) {
+    bool r = ame_real_SetWindowFullscreen ? ame_real_SetWindowFullscreen(window, fullscreen) : false;
+    NSDebugLog(@"[SDLHook] SDL_SetWindowFullscreen(%p, %d) -> %d", window, (int)fullscreen, (int)r);
+    return r;
+}
+
+static const bool *ame_SDL_GetKeyboardState(int *numkeys) {
+    const bool *r = ame_real_GetKeyboardState ? ame_real_GetKeyboardState(numkeys) : NULL;
+    return r;
+}
+
+// Air Task 32：当 MC 通过 SDL_LoadFunction（而非 dlsym）解析符号时，同样把
+// 窗口生命周期钩子装上（防御性双路覆盖）。
+static void ame_maybeWrapWindowHook(const char *name, void **out) {
+    if (name == NULL || out == NULL || *out == NULL) return;
+    if (strcmp(name, "SDL_HideWindow") == 0) {
+        if (ame_real_HideWindow == NULL)
+            ame_real_HideWindow = (ame_fn_SDL_HideWindow)*out;
+        *out = (void *)ame_SDL_HideWindow;
+    } else if (strcmp(name, "SDL_SetWindowSize") == 0) {
+        if (ame_real_SetWindowSize == NULL)
+            ame_real_SetWindowSize = (ame_fn_SDL_SetWindowSize)*out;
+        *out = (void *)ame_SDL_SetWindowSize;
+    } else if (strcmp(name, "SDL_SetWindowPosition") == 0) {
+        if (ame_real_SetWindowPosition == NULL)
+            ame_real_SetWindowPosition = (ame_fn_SDL_SetWindowPosition)*out;
+        *out = (void *)ame_SDL_SetWindowPosition;
+    } else if (strcmp(name, "SDL_SetWindowFullscreen") == 0) {
+        if (ame_real_SetWindowFullscreen == NULL)
+            ame_real_SetWindowFullscreen = (ame_fn_SDL_SetWindowFullscreen)*out;
+        *out = (void *)ame_SDL_SetWindowFullscreen;
+    } else if (strcmp(name, "SDL_GetKeyboardState") == 0) {
+        if (ame_real_GetKeyboardState == NULL)
+            ame_real_GetKeyboardState = (ame_fn_SDL_GetKeyboardState)*out;
+        *out = (void *)ame_SDL_GetKeyboardState;
+    }
+}
+
 static bool ame_SDL_PollEvent(void *event) {
     if (ame_real_PollEvent == NULL) {
         ame_real_PollEvent =
@@ -1988,6 +2109,7 @@ static void *ame_SDL_LoadFunction(void *handle, const char *name) {
     void *r = ame_real_LoadFunction ? ame_real_LoadFunction(handle, name) : NULL;
     ame_maybeWrapEgl(name, &r);
     ame_maybeWrapGl(name, &r);
+    ame_maybeWrapWindowHook(name, &r);
     return r;
 }
 
@@ -2919,6 +3041,49 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         NSDebugLog(@"[SDLHook] hooked SDL_ShowWindow -> enforce SDL3 presentation "
                    @"invariants (hide SDL's own UIWindow)");
         return (void *)ame_SDL_ShowWindow;
+    }
+    // Air Task 32/51/67 移植：窗口生命周期钩子安装。
+    // SDL_SetWindowSize / SDL_SetWindowPosition 的钳制是「必须手动改一次分辨率
+    // 才恢复」与「画面缩在角落」的根治点（Task51 Fix E，注释见函数处）。
+    if (strcmp(name, "SDL_SetWindowSize") == 0) {
+        if (ame_real_SetWindowSize == NULL) {
+            ame_real_SetWindowSize =
+                (ame_fn_SDL_SetWindowSize)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_SetWindowSize -> Task51 pixel->point clamp");
+        return (void *)ame_SDL_SetWindowSize;
+    }
+    if (strcmp(name, "SDL_SetWindowPosition") == 0) {
+        if (ame_real_SetWindowPosition == NULL) {
+            ame_real_SetWindowPosition =
+                (ame_fn_SDL_SetWindowPosition)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_SetWindowPosition -> Task51 negative-offset clamp");
+        return (void *)ame_SDL_SetWindowPosition;
+    }
+    if (strcmp(name, "SDL_HideWindow") == 0) {
+        if (ame_real_HideWindow == NULL) {
+            ame_real_HideWindow =
+                (ame_fn_SDL_HideWindow)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_HideWindow");
+        return (void *)ame_SDL_HideWindow;
+    }
+    if (strcmp(name, "SDL_SetWindowFullscreen") == 0) {
+        if (ame_real_SetWindowFullscreen == NULL) {
+            ame_real_SetWindowFullscreen =
+                (ame_fn_SDL_SetWindowFullscreen)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_SetWindowFullscreen");
+        return (void *)ame_SDL_SetWindowFullscreen;
+    }
+    if (strcmp(name, "SDL_GetKeyboardState") == 0) {
+        if (ame_real_GetKeyboardState == NULL) {
+            ame_real_GetKeyboardState =
+                (ame_fn_SDL_GetKeyboardState)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_GetKeyboardState");
+        return (void *)ame_SDL_GetKeyboardState;
     }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。
