@@ -126,7 +126,7 @@ JIT（即时编译）是流畅运行游戏的关键。请根据自身环境选�
 - [@LanRhyme](https://github.com/LanRhyme) -- iOS 26 兼容性适配及日志改进
 - [@WeiErLiTeo](https://github.com/WeiErLiTeo) -- Mod 下载功能集成、TouchController 优化、双指长按唤出键盘
 - [@Li2548](https://github.com/Li2548) -- 上游同步维护
-- [@Gsjsjzhznsz](https://github.com/Gsjsjzhznsz) -- Air 启动器作者；SDL3 呈现链适配、Minecraft 26.3 黑屏（FBO0 自愈 blit）与分辨率自愈修复、MobileGlues 死锁修复、Zink OpenGL 桥接
+- [@Gsjsjzhznsz](https://github.com/Gsjsjzhznsz) -- SDL3 呈现链适配、Minecraft 26.3 黑屏（FBO0 自愈 blit）与分辨率自愈修复、MobileGlues 死锁修复、Zink OpenGL 桥接
 
 ## 第三方组件
 
