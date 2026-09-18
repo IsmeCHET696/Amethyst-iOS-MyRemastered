@@ -14,6 +14,8 @@
 #include <MG_Util/Async/ShaderCompilePool.h>
 #include <MG_Util/Converters/GLToStr/GLEnumConverter.h>
 #include <MG_Util/ShaderTranspiler/CompileEnv.h>
+#include <MG_Pipe/PipeMutation.h>
+#include <MG_State/GLState/StateObjectDeathNotice.h>
 
 const char* kDefaultFragmentShaderSource = R"(#version 460 core
 layout(location = 0) out vec4 FragColor;
@@ -28,7 +30,34 @@ namespace MobileGL::MG_State::GLState {
         return s_nextProgramLifetimeId.fetch_add(1, std::memory_order_relaxed);
     }
 
-    ProgramObject::~ProgramObject() { CancelLink(); }
+    ProgramObject::~ProgramObject() {
+        CancelLink();
+#if MOBILEGL_PIPE_PUSH
+        // P2 step e2: ANNOUNCE the death instead of leaving the backend to discover it in a
+        // garbage sweep. This is the last SharedPtr to this object dropping - not
+        // glDeleteProgram, which only marks the name and leaves a still-bound object very much
+        // alive - so it is the exact moment the backend's twin, and the driver storage that
+        // twin owns, stop being reachable. The notice carries the lifetime id because the
+        // object no longer exists to be passed, and because the lifetime id is what the client
+        // slot allocator resolves the handle from. No-op unless a backend registered the ops
+        // (a pull build declares none at all).
+        //
+        // P4a D-I1: the notice is no longer raised directly - it is step 2 of the ONE
+        // client-side death helper for this kind, which emits delete_shader_state first,
+        // raises the notice second and frees the slot last. The client mints the ShaderCso, so
+        // the client is where its death has to be spoken from: a backend death-ops table is a
+        // redundant, idempotent SECOND path, and under a backend that installs none it was
+        // previously the ONLY one, which is how a slot leaks for the life of the process.
+        //
+        // AN ORDINARY PROGRAM AND A PIPELINE COMPOSITE TAKE THIS SAME LINE. A composite is an
+        // ordinary ProgramObject with its own lifetime id, its slot merely comes out of the
+        // reserved band, and its OTHER release path - the pipeline cache dropping it when the
+        // draw-program signature moves - goes through the same helper. Whichever runs second is
+        // a proven no-op, because the slot allocator refuses a slot that is not live at that
+        // generation.
+        MG_Pipe::MGPipeEmitShaderCsoDestroyAndFree(m_lifetimeId);
+#endif
+    }
 
     // EnsureLinkJoined() is defined inline in ProgramObject.h (see the comment there for
     // why: ~1200 call sites, no LTO). Only its blocking half lives here.

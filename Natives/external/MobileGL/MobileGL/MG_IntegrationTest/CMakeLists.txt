@@ -51,10 +51,19 @@ endif()
 add_executable(MobileGLIntegrationTest
     Main.cpp
     Harness/HeadlessGL.cpp
+    Harness/BackendCapsPeek.cpp
+    Harness/PipeSlotPeek.cpp
+    Harness/PipeApplyPeek.cpp
+    Harness/P4aSeamPeek.cpp
+    Harness/P4aFinalFixPeek.cpp
+    Harness/PersistentMapPeek.cpp
+    Harness/SplitRuntimePeek.cpp
     Scenarios/OrientationScenario.cpp
     Scenarios/CrossFrameBufferScenario.cpp
     Scenarios/ResidentIndexScenario.cpp
     Scenarios/MultiDrawScenario.cpp
+    Scenarios/IndexedDrawFamilyScenario.cpp
+    Scenarios/SyncWireScenario.cpp
     Scenarios/DrawParametersScenario.cpp
     Scenarios/AsyncCompileScenario.cpp
     Scenarios/XfbAfterClipDistanceScenario.cpp
@@ -126,6 +135,21 @@ add_executable(MobileGLIntegrationTest
     Scenarios/ClearTexImageUndefinedLevelZeroScenario.cpp
     Scenarios/RenderbufferBlendFormatScenario.cpp
     Scenarios/DualSourceBlendScenario.cpp
+    Scenarios/PipeVerifyArmingScenario.cpp
+    Scenarios/PoisonOmissionScenario.cpp
+    Scenarios/HandleRecycleScenario.cpp
+    Scenarios/CsoContentAddressingScenario.cpp
+    Scenarios/ResourceSubsystemControlScenario.cpp
+    Scenarios/TextureParamsWithoutASamplerViewScenario.cpp
+    Scenarios/TextureUploadShapeScenario.cpp
+    Scenarios/ObjectSubsystemControlScenario.cpp
+    Scenarios/P4aSeamAuditScenario.cpp
+    Scenarios/P4aFinalFixScenario.cpp
+    # P5's two new scenarios, targets B and C of the reduced path (BRIEF-P5 4). Both are
+    # ORDINARY GL scenarios that run in every lane; the DirectGLES.Split. entries further down
+    # run the same cases with MOBILEGL_TRANSPORT=inproc.
+    Scenarios/TriangleScenario.cpp
+    Scenarios/PersistentCoherentMapScenario.cpp
 )
 
 target_include_directories(MobileGLIntegrationTest PRIVATE
@@ -315,6 +339,330 @@ function(mgl_itest_join_environment outVar)
     set(${outVar} "${joined}" PARENT_SCOPE)
 endfunction()
 
+# --- what THIS TREE implements, answered by the build rather than by a person ----------
+#
+# Two P2 entries assert something that only EXISTS once another P2 package has landed:
+# HandleRecycleScenario's Handles arm needs a backend keyed on {slot, gen} (packages C and D),
+# its AbaControl arm needs a consumer for MOBILEGL_PIPE_HANDLE_ABA_CONTROL (package D), and
+# CsoContentAddressingScenario needs the client-side tracker that mints CSOs at all (package B).
+# The gates package is written and merged FIRST, against the P2 contract commit, precisely so
+# that the AbaControl red is on the record before either backend is touched - so for a while
+# those entries have nothing to assert.
+#
+# The honest report for that is a SKIP naming what is missing, never a deleted registration and
+# never a green that means "the thing I test does not exist yet". What decides the skip is
+# THIS block, so that nobody has to remember to remove a hand-written guard:
+#
+#   * two of the three answers are pure EXISTENCE checks, through file(GLOB CONFIGURE_DEPENDS).
+#     Ninja re-evaluates such a glob before every build and reconfigures only when the RESULT
+#     changes, so these cost nothing until the file appears - and then they arm themselves.
+#   * the third has to read a file's CONTENTS, because package D re-keys inside an existing
+#     source rather than adding one. VertexInputStateFactory.cpp is the one file both of D's
+#     answers live in (ComputeHash's buffer key is what the re-key changes AND what the ABA
+#     knob reverts), it is small, and it is watched by name - so an edit to it reconfigures and
+#     an edit anywhere else in the backend does not.
+#
+# Every verdict is printed at configure time: a marker that silently answered "no" for a tree
+# that does implement the thing would turn a real gate into a permanent skip.
+set(MGL_ITEST_CAPABILITY_ENV "")
+
+# Whether the library under test compiled the push arm. Passed in rather than inferred, because
+# the two CSO counters and the cso[] bracket of the stats line are #if MOBILEGL_PIPE_PUSH: in a
+# pull build there is no CSO to mint and no channel to read, so the control has nothing to say -
+# and "nothing to say" must be a SKIP that names the reason, not an assertion failure about a
+# missing bracket.
+#
+# The lanes themselves are registered in BOTH builds even so. `ctest -L integration-gpu` has to
+# be name-for-name identical between the pull build and the push build (P2 gate G2), and a lane
+# that exists in only one of them breaks that comparison for every future package - a much worse
+# outcome than four entries that skip.
+if (MOBILEGL_PIPE_PUSH)
+    list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_PIPE_PUSH_BUILD=1")
+endif()
+
+# THE THREE MARKERS BELOW ANSWER A QUESTION ABOUT THE SOURCE TREE, so each is only a true
+# statement about THIS LIBRARY while this build compiles the arm the source implements - and all
+# three arms are `#if MOBILEGL_PIPE_PUSH`. A pull build has no {slot, gen} key (the slot tables
+# and the re-keyed memos are push-only) and no Features.PipeHandleAbaControl at all (Config.h
+# declares the field inside `#if MOBILEGL_PIPE_PUSH` and ConfigLoader parses it in the same arm).
+# A source-only probe would therefore arm the PULL build's lanes the moment packages C and D
+# land: the AbaControl lane would go hard red on a gate G2 requires green (the guards it means to
+# defeat are still in force, so the scenario's "expect the stale pixels" assertion fails), and the
+# Handles lane would report green against a library that contains no re-key at all - the
+# "test that cannot fail" this scenario exists to avoid.
+#
+# So the whole block sits under the same `if (MOBILEGL_PIPE_PUSH)` as MGITEST_PIPE_PUSH_BUILD, and
+# HandleRecycleScenario re-checks that marker before either arm asserts, so a hand-forced
+# environment cannot arm an arm this build does not have either.
+#
+# ALL FOUR MARKERS ARE CONTENT PROBES, AND NONE OF THEM NAMES A FILE. A probe for a filename asks
+# the wrong question: the owning package chooses its own file layout, so the moment it moves the
+# code the probe answers "no" forever and the arm skips with a reason that has become false - a
+# test quietly measuring nothing, which is the one outcome this whole scenario exists to prevent.
+# The CSO probe was rewritten for exactly that reason once already; the magma probe still read one
+# hard-coded .cpp, and package D already keeps one of its two Features.PipeHandleAbaControl
+# consumers in a different file of the same directory (Renderer/VulkanRenderer.cpp), so it was one
+# refactor away from a permanent AbaControl skip. So all four now ask "does any source in the
+# directory the owning package owns name this symbol?", which is the thing each arm actually needs.
+#
+# Staleness cannot creep in from either side: the GLOB is CONFIGURE_DEPENDS (a file added or
+# removed re-runs it) and every file it finds is appended to CMAKE_CONFIGURE_DEPENDS (an edit to
+# one re-runs it).
+function(mgl_itest_probe_for_symbol outVar directory symbolRegex)
+    file(GLOB_RECURSE mglItestProbeSources CONFIGURE_DEPENDS
+        "${directory}/*.h" "${directory}/*.hpp" "${directory}/*.cpp" "${directory}/*.c")
+    set(mglItestProbeHit "")
+    foreach(mglItestProbeSource IN LISTS mglItestProbeSources)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mglItestProbeSource}")
+        file(STRINGS "${mglItestProbeSource}" mglItestProbeLines REGEX "${symbolRegex}")
+        if (mglItestProbeLines AND NOT mglItestProbeHit)
+            set(mglItestProbeHit "${mglItestProbeSource}")
+        endif()
+    endforeach()
+    set(${outVar} "${mglItestProbeHit}" PARENT_SCOPE)
+endfunction()
+
+# The same probe, over a CONJUNCTION: BOTH regexes matched ANYWHERE UNDER the directory, not
+# necessarily in the same file. outVar is set to "<file matching A> + <file matching B>" when both
+# were found and to the empty string otherwise.
+#
+# P4a needs it for exactly one question and the question cannot be asked any other way. "Does
+# MOBILEGL_PIPE_HANDLE_ABA_CONTROL defeat the identity of P4a's OBJECT kinds on this backend?" is
+# not answered by "some source reads Features.PipeHandleAbaControl" - MagmaPipeArms.h does, and its
+# consumers are Magma's VERTEX-INPUT keys, so a single-regex probe would arm the six P4a ABA
+# controls on a backend where the knob cannot reach a texture, a framebuffer, a sampler, a view or a
+# program, and every one of them would assert a corruption nothing on the tree can produce - a hard
+# red on an always-on integration-gpu lane. Nor is it answered by "some source names a P4a subsystem
+# bit", which will become true for a backend that honours the mask long before anyone wires the
+# knob. What the arm needs is BOTH FACTS TO BE TRUE OF THE BACKEND.
+#
+# DIRECTORY-WIDE RATHER THAN PER FILE, and that is review finding F-M5 rather than a preference.
+# Requiring one file to carry both makes the arming depend on the FILE LAYOUT a later package
+# chooses: a backend that wires the knob in Managers.cpp while its P4a subsystem constants live in
+# SlotTables.h satisfies the question and fails the probe, the six controls keep printing wired=0
+# and asserting the correct pixels, and NOTHING fails, warns or records that the expected flip did
+# not happen - the one failure mode a control whose flip is in the future has. The false-positive
+# this trades against is a backend that reads the knob somewhere and names a P4a bit somewhere else
+# without connecting them; that costs a red lane an engineer must look at, which is the direction
+# that gets noticed. Both spellings of the answer are printed, so the configure log says which file
+# supplied which half.
+#
+# Same staleness guarantees as the single-regex probe: CONFIGURE_DEPENDS on the glob, and every file
+# it finds appended to CMAKE_CONFIGURE_DEPENDS.
+function(mgl_itest_probe_for_two_symbols outVar directory symbolRegexA symbolRegexB)
+    file(GLOB_RECURSE mglItestProbeSources CONFIGURE_DEPENDS
+        "${directory}/*.h" "${directory}/*.hpp" "${directory}/*.cpp" "${directory}/*.c")
+    set(mglItestProbeHitA "")
+    set(mglItestProbeHitB "")
+    foreach(mglItestProbeSource IN LISTS mglItestProbeSources)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mglItestProbeSource}")
+        if (NOT mglItestProbeHitA)
+            file(STRINGS "${mglItestProbeSource}" mglItestProbeLinesA REGEX "${symbolRegexA}")
+            if (mglItestProbeLinesA)
+                set(mglItestProbeHitA "${mglItestProbeSource}")
+            endif()
+        endif()
+        if (NOT mglItestProbeHitB)
+            file(STRINGS "${mglItestProbeSource}" mglItestProbeLinesB REGEX "${symbolRegexB}")
+            if (mglItestProbeLinesB)
+                set(mglItestProbeHitB "${mglItestProbeSource}")
+            endif()
+        endif()
+    endforeach()
+    if (mglItestProbeHitA AND mglItestProbeHitB)
+        set(${outVar} "${mglItestProbeHitA} + ${mglItestProbeHitB}" PARENT_SCOPE)
+    else()
+        set(${outVar} "" PARENT_SCOPE)
+    endif()
+endfunction()
+
+if (MOBILEGL_PIPE_PUSH)
+    # DirectGLES' Track H arm, probed by the subsystem bit it is gated on rather than by
+    # SlotTables.h existing: the bit is declared in the contract (MG_Pipe/MGPipe.h:77) and the
+    # backend has to name it to honour MOBILEGL_PIPE_PUSH's default mask, whatever files package C
+    # spreads the slot tables across.
+    mgl_itest_probe_for_symbol(MGL_ITEST_ESPRYT_SLOTS
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Backend/DirectGLES" "kMGPipeSubsystemEsprytSlots")
+    if (MGL_ITEST_ESPRYT_SLOTS)
+        message(STATUS "Integration tests: DirectGLES is keyed on {slot, gen} (${MGL_ITEST_ESPRYT_SLOTS})")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_HANDLE_REKEY_DirectGLES=1")
+    else()
+        message(STATUS "Integration tests: no DirectGLES source names kMGPipeSubsystemEsprytSlots - "
+                       "HandleRecycle.Handles will SKIP on it")
+    endif()
+
+    # The CSO counters' EMITTER. The tracker package may implement the tracker and the cache
+    # header-only - today it does (MG_Impl/Pipe/{Tracker,CsoCache}.h, no Tracker.cpp) - so what is
+    # looked for is what the control actually reads: a source emitting the two counters.
+    mgl_itest_probe_for_symbol(MGL_ITEST_CSO_EMITTER
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Impl/Pipe" "RenderStateCso(Mints|Binds)")
+    if (MGL_ITEST_CSO_EMITTER)
+        message(STATUS "Integration tests: the CSO counters have an emitter (${MGL_ITEST_CSO_EMITTER})")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_PIPE_TRACKER_PRESENT=1")
+    else()
+        message(STATUS "Integration tests: no MG_Impl/Pipe source emits RenderStateCsoMints/Binds - "
+                       "CsoContentAddressing will SKIP")
+    endif()
+
+    # DirectVulkan's Track H arm, and the ABA knob's consumer. Both over the whole backend
+    # directory: the re-key is subsystem 4's bit wherever package D reads it, and the knob has a
+    # consumer if ANY DirectVulkan source reverts a guard on it - today two do, in two files.
+    mgl_itest_probe_for_symbol(MGL_ITEST_MAGMA_REKEY
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Backend/DirectVulkan" "kMGPipeSubsystemMagmaVertexInput")
+    if (MGL_ITEST_MAGMA_REKEY)
+        message(STATUS "Integration tests: DirectVulkan's vertex input is keyed on {slot, gen} "
+                       "(${MGL_ITEST_MAGMA_REKEY})")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_HANDLE_REKEY_DirectVulkan=1")
+    else()
+        message(STATUS "Integration tests: no DirectVulkan source names kMGPipeSubsystemMagmaVertexInput - "
+                       "HandleRecycle.Handles will SKIP on it")
+    endif()
+
+    # P3a's buffer question, and it is NOT the two above. Bits 5/6 re-keyed each backend's
+    # VERTEX-INPUT memos; a BUFFER only travels as a handle once the resource_* family does
+    # (P3a for DirectGLES, P7 for DirectVulkan), and until then a buffer's backend twin is
+    # still reached from the frontend BufferObject. HandleRecycle's buffer case therefore has
+    # a marker of its own: reading the P2 one would arm its Handles arm on a tree where
+    # nothing about a buffer is keyed on a handle.
+    #
+    # Probed by MGPipeResourceOps - the op table PipeApply.h declares and a backend registers -
+    # over each backend's whole directory, for the reason the block above gives: the owning
+    # package picks its own file layout, and a filename probe would answer "no" forever the
+    # moment it moved the code.
+    foreach(mglItestResourceBackend DirectGLES DirectVulkan)
+        mgl_itest_probe_for_symbol(MGL_ITEST_RESOURCE_OPS
+            "${MGL_ITEST_ROOT}/MobileGL/MG_Backend/${mglItestResourceBackend}" "MGPipeResourceOps")
+        if (MGL_ITEST_RESOURCE_OPS)
+            message(STATUS "Integration tests: ${mglItestResourceBackend} registers a resource op table "
+                           "(${MGL_ITEST_RESOURCE_OPS})")
+            list(APPEND MGL_ITEST_CAPABILITY_ENV
+                "MGITEST_HANDLE_REKEY_RESOURCES_${mglItestResourceBackend}=1")
+        else()
+            message(STATUS "Integration tests: no ${mglItestResourceBackend} source names "
+                           "MGPipeResourceOps - HandleRecycle.Handles' buffer case will SKIP on it")
+        endif()
+    endforeach()
+
+    # The client-side emitter of P3a's map-persistent-roundtrips counter, which is what
+    # StorageBufferRegrow, LargeArenaAdoption and ResourceSubsystemControl read. Same shape and
+    # same reason as the CSO emitter probe above: the counter is minted in MG_Impl/Pipe (package
+    # B), header-only today, so the question is "does any source there emit it", not "does a
+    # named file exist". Until it does, mpr= is structurally zero and an assertion about it
+    # would be a statement about nothing.
+    mgl_itest_probe_for_symbol(MGL_ITEST_RESOURCE_EMITTER
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Impl/Pipe" "MapPersistentRoundtrips")
+    if (MGL_ITEST_RESOURCE_EMITTER)
+        message(STATUS "Integration tests: map-persistent-roundtrips has an emitter "
+                       "(${MGL_ITEST_RESOURCE_EMITTER})")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_PIPE_RESOURCE_EMITTER_PRESENT=1")
+    else()
+        message(STATUS "Integration tests: no MG_Impl/Pipe source emits MapPersistentRoundtrips - "
+                       "StorageBufferRegrow's, LargeArenaAdoption's and ResourceSubsystemControl's "
+                       "mpr entries will SKIP")
+    endif()
+
+    # P4a's THIRD re-key question, per backend, and it is not either of the two above. Bits 5/6
+    # re-keyed each backend's VERTEX-INPUT memos and bit 7/8 the BUFFER's; P4a re-keys six OBJECT
+    # classes - texture, renderbuffer, framebuffer, sampler CSO, sampler view, shader CSO - behind
+    # four new subsystem bits, and a backend has to NAME one of those constants to honour
+    # MOBILEGL_PIPE_PUSH's default mask. A P4a case that read either older marker would arm its
+    # Handles arm on a tree where nothing about a texture is keyed on a handle: green for a re-key
+    # that does not exist. Probed by the constants rather than by a file, for the reason the block
+    # above gives - packages D and E choose their own file layout.
+    foreach(mglItestObjectBackend DirectGLES DirectVulkan)
+        mgl_itest_probe_for_symbol(MGL_ITEST_OBJECT_REKEY
+            "${MGL_ITEST_ROOT}/MobileGL/MG_Backend/${mglItestObjectBackend}"
+            "kMGPipeSubsystem(Framebuffer|TextureResources|Samplers|Programs)")
+        if (MGL_ITEST_OBJECT_REKEY)
+            message(STATUS "Integration tests: ${mglItestObjectBackend} is keyed on {slot, gen} for "
+                           "P4a's object families (${MGL_ITEST_OBJECT_REKEY})")
+            list(APPEND MGL_ITEST_CAPABILITY_ENV
+                "MGITEST_HANDLE_REKEY_OBJECTS_${mglItestObjectBackend}=1")
+        else()
+            message(STATUS "Integration tests: no ${mglItestObjectBackend} source names "
+                           "kMGPipeSubsystem{Framebuffer,TextureResources,Samplers,Programs} - "
+                           "HandleRecycle's six P4a cases will SKIP their Handles arm on it")
+        endif()
+
+        # ...and whether the ABA knob reaches those kinds THERE. A conjunction over the WHOLE
+        # backend directory, for the reason mgl_itest_probe_for_two_symbols states: reading the
+        # knob is not the same as steering P4a's keys with it, so the weaker single-regex evidence
+        # would turn six always-on entries into a permanent red - but requiring one FILE to carry
+        # both halves would let a backend satisfy the question and miss the probe, and the six
+        # controls would then keep asserting the correct pixels with nothing recording that the
+        # flip was forgotten (F-M5).
+        mgl_itest_probe_for_two_symbols(MGL_ITEST_OBJECT_ABA
+            "${MGL_ITEST_ROOT}/MobileGL/MG_Backend/${mglItestObjectBackend}"
+            "PipeHandleAbaControl"
+            "kMGPipeSubsystem(Framebuffer|TextureResources|Samplers|Programs)")
+        if (MGL_ITEST_OBJECT_ABA)
+            message(STATUS "Integration tests: MOBILEGL_PIPE_HANDLE_ABA_CONTROL steers "
+                           "${mglItestObjectBackend}'s P4a object keys (${MGL_ITEST_OBJECT_ABA})")
+            list(APPEND MGL_ITEST_CAPABILITY_ENV
+                "MGITEST_HANDLE_ABA_OBJECTS_${mglItestObjectBackend}=1")
+        else()
+            message(STATUS "Integration tests: MobileGL/MG_Backend/${mglItestObjectBackend} does not "
+                           "both read Features.PipeHandleAbaControl and name a P4a subsystem bit "
+                           "somewhere under it - HandleRecycle's six P4a cases will assert the "
+                           "CORRECT pixels on the AbaControl arm and say that it is not a control "
+                           "for them yet")
+        endif()
+    endforeach()
+
+    # The client-side emitter of P4a's four suppressor-visible emission counters, which is what
+    # ObjectSubsystemControl reads. Same shape and same reason as the CSO and map-persistent
+    # emitter probes above: the emitters are minted in MG_Impl/Pipe (packages B and C), header-only
+    # by design (D-P), so the question is "does any source there emit it", not "does a named file
+    # exist". Until one does, every counter in the emit[] bracket is structurally zero in BOTH arms
+    # of the A/B and an assertion about their difference would be a statement about nothing.
+    mgl_itest_probe_for_symbol(MGL_ITEST_OBJECT_EMITTER
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Impl/Pipe" "FramebufferEmissions")
+    if (MGL_ITEST_OBJECT_EMITTER)
+        message(STATUS "Integration tests: P4a's object emissions have an emitter "
+                       "(${MGL_ITEST_OBJECT_EMITTER})")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_PIPE_OBJECT_EMITTER_PRESENT=1")
+    else()
+        message(STATUS "Integration tests: no MG_Impl/Pipe source emits FramebufferEmissions - "
+                       "ObjectSubsystemControl's emission case will SKIP")
+    endif()
+
+    # ...and the CLIENT half of the texture-upload shape, separately, because it is a different
+    # question with a different owner's file behind it (review F-m7). ctu= is emitted by PipeStats
+    # in EVERY push build whether or not anything increments it, so "the counter read zero" and
+    # "no client emitter exists" are the same number and TextureUploadShape cannot tell them apart
+    # from the summary line alone. Once package B's texture emitter lands, an emitter that stopped
+    # emitting would read exactly like no emitter at all and the two-sided assertion the scenario
+    # exists for would pass while comparing nothing. This probe is what separates them.
+    mgl_itest_probe_for_symbol(MGL_ITEST_CLIENT_TEXTURE_UPLOAD_EMITTER
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Impl/Pipe" "ClientTextureUploadEmissions")
+    if (MGL_ITEST_CLIENT_TEXTURE_UPLOAD_EMITTER)
+        message(STATUS "Integration tests: the client texture-upload counter has an emitter "
+                       "(${MGL_ITEST_CLIENT_TEXTURE_UPLOAD_EMITTER}) - TextureUploadShape's "
+                       "two-sided assertion is live")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_PIPE_CLIENT_TEXTURE_UPLOAD_EMITTER_PRESENT=1")
+    else()
+        message(STATUS "Integration tests: no MG_Impl/Pipe source emits "
+                       "ClientTextureUploadEmissions - TextureUploadShape records the SERVER shape "
+                       "only and asserts that ctu= is zero")
+    endif()
+
+    mgl_itest_probe_for_symbol(MGL_ITEST_MAGMA_ABA
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Backend/DirectVulkan" "PipeHandleAbaControl")
+    if (MGL_ITEST_MAGMA_ABA)
+        message(STATUS "Integration tests: MOBILEGL_PIPE_HANDLE_ABA_CONTROL has a consumer "
+                       "(${MGL_ITEST_MAGMA_ABA})")
+        list(APPEND MGL_ITEST_CAPABILITY_ENV "MGITEST_HANDLE_ABA_IMPLEMENTED=1")
+    else()
+        message(STATUS "Integration tests: no DirectVulkan source names PipeHandleAbaControl - "
+                       "HandleRecycle.AbaControl will SKIP")
+    endif()
+else()
+    message(STATUS "Integration tests: pull build - HandleRecycle.{Handles,AbaControl}, "
+                   "CsoContentAddressing, ResourceSubsystemControl, ObjectSubsystemControl and "
+                   "TextureUploadShape stay registered (G2) and SKIP: every arm they assert is "
+                   "compiled only under MOBILEGL_PIPE_PUSH")
+endif()
+
 mgl_itest_join_environment(MGL_ITEST_GLES_ENVIRONMENT
     "MOBILEGL_BACKEND_TYPE=DirectGLES" ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_ENVIRONMENT
@@ -460,6 +808,20 @@ gtest_discover_tests(MobileGLIntegrationTest
 # emulation never runs - the ambient registration would be exercising the un-stripped path
 # twice and calling it coverage. With the variable set, the blocks really are emitted with no
 # location and the assertion is about the spelling the device gets.
+# RESOURCE_LOCK, on this lane and on the three below it, and it is a bug fix rather than a
+# precaution. Each of these lanes gives a WHOLE SCENARIO one MOBILEGL_LOG_FILE_PATH, and one case
+# in each reads that log back to prove the pinned emulation actually armed. The library opens the
+# log fopen(path, "w"), so every process in the lane TRUNCATES it - and under `ctest -j` a sibling
+# case of the same lane can truncate it while the arming case is reading, which reads back as "the
+# log carries no arming line" and fails a healthy lane. Measured on this tree: three runs of the
+# full integration-gpu label at -j 8 produced 4 failures, 0 and 2, always one of these arming
+# cases, never the same set twice.
+#
+# The rule stated above the verify block - a case that reads the log needs a lane whose filter
+# selects it alone - would fix it by re-filtering, but that would RENAME the arming entries, and
+# an existing ctest name may never disappear (gate G14). A ctest RESOURCE_LOCK named after the log
+# is the same guarantee without touching a name: ctest never runs two entries holding the same lock
+# at once, so the only processes that can truncate a lane's log are ones nobody is reading it for.
 gtest_discover_tests(MobileGLIntegrationTest
     TEST_PREFIX "DirectGLES.UnlocatedIoBlocks."
     TEST_FILTER "UnlocatedIoBlockScenario.*"
@@ -467,7 +829,38 @@ gtest_discover_tests(MobileGLIntegrationTest
     PROPERTIES
         LABELS integration-gpu
         TIMEOUT ${MGL_ITEST_TIMEOUT}
+        RESOURCE_LOCK unlocated-io-blocks.log
         ENVIRONMENT "${MGL_ITEST_GLES_UNLOCATED_IO_BLOCKS_ENVIRONMENT}"
+)
+
+# P4a final review C-2: the dirty-then-delete case, with the allocator SCRIBBLING every freed
+# block. The defect this pins was a client emitter resolving a dead-but-not-recycled texture
+# handle to the freed ITextureObject* and calling a virtual on it from the next verb's drain;
+# whether that reads the object's ghost or faults depends on what the allocator did with the
+# block, so the ambient registrations above run the case as the application would see it and
+# these two run it with MALLOC_PERTURB_ set, where a resolved-but-dead pointer faults rather
+# than passes. Both backends: the death path is backend-neutral by ruling (ID-8).
+mgl_itest_join_environment(MGL_ITEST_GLES_MALLOC_PERTURB_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MALLOC_PERTURB_=165" ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_MALLOC_PERTURB_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MALLOC_PERTURB_=165" ${MGL_ITEST_VULKAN_ENV})
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.MallocPerturb."
+    TEST_FILTER "P4aFinalFixScenario.ADirtyTextureDeletedBeforeAnyVerbIsWalkedByTheNextDrain"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_MALLOC_PERTURB_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.MallocPerturb."
+    TEST_FILTER "P4aFinalFixScenario.ADirtyTextureDeletedBeforeAnyVerbIsWalkedByTheNextDrain"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_MALLOC_PERTURB_ENVIRONMENT}"
 )
 
 # AsyncCompileScenario, with asynchronous compilation PINNED ON per backend.
@@ -583,6 +976,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     PROPERTIES
         LABELS integration-gpu
         TIMEOUT ${MGL_ITEST_TIMEOUT}
+        RESOURCE_LOCK primgen-query-reroute.log
         ENVIRONMENT "${MGL_ITEST_VULKAN_PRIMGEN_REROUTE_ENVIRONMENT}"
 )
 
@@ -618,6 +1012,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     PROPERTIES
         LABELS integration-gpu
         TIMEOUT ${MGL_ITEST_TIMEOUT}
+        RESOURCE_LOCK point-size-demotion-gles.log
         ENVIRONMENT "${MGL_ITEST_GLES_POINT_SIZE_DEMOTION_ENVIRONMENT}"
 )
 
@@ -628,5 +1023,1194 @@ gtest_discover_tests(MobileGLIntegrationTest
     PROPERTIES
         LABELS integration-gpu
         TIMEOUT ${MGL_ITEST_TIMEOUT}
+        RESOURCE_LOCK point-size-demotion-vulkan.log
         ENVIRONMENT "${MGL_ITEST_VULKAN_POINT_SIZE_DEMOTION_ENVIRONMENT}"
 )
+
+# --- the third CI mode: MOBILEGL_PIPE_VERIFY -----------------------------------
+#
+# ARCHITECTURE.md 13.2-(2) asks for a THIRD build mode next to pull and push: two state models in
+# one address space, compared field by field at every verb boundary and again at every accessor
+# read, 5-10x slower and never shipped. These entries are that mode's lane. They exist only when
+# the library was configured with -DMOBILEGL_PIPE_VERIFY=ON, which is deliberate and is half of
+# what makes the lane falsifiable: `ctest -L integration-verify --no-tests=error` in a build that
+# forgot the option matches NO tests and fails, instead of reporting a green run of nothing.
+#
+# The other half is PipeVerifyArmingScenario.Armed, which asserts the library's own arming line -
+# because MOBILEGL_PIPE_VERIFY=1 in the environment of a library that never compiled the
+# comparator in is a silent no-op that looks exactly like a clean pass.
+#
+# Three things about the ENVIRONMENT properties below, each of which has already gone wrong once
+# in this file:
+#   * every list APPENDS ${MGL_ITEST_COMMON_ENV} / ${MGL_ITEST_VULKAN_ENV}. A ctest ENVIRONMENT
+#     entry overrides the job environment for the names it lists, so an entry that named only its
+#     own knobs would lose the EGL vendor and Vulkan ICD pinning and run against whichever driver
+#     the loader found first.
+#   * the ambient Verify. entries name NEITHER MOBILEGL_PIPE_VERIFY_CORRUPT NOR
+#     MOBILEGL_PIPE_POISON_OMIT. That is what lets CI's two always-on negative-control steps
+#     export those knobs in the JOB environment and have them reach the test processes; a
+#     property entry of the same name would silently win and the controls would prove nothing.
+#   * MOBILEGL_LOG_FILE_PATH is per lane, and "per lane" is the exact limit of what it proves. It
+#     is the only channel a test process has for reading the library's own report (MG_Config is not
+#     reachable from this module), but the log is opened fopen(path, "w"), so every process in a
+#     lane TRUNCATES it: after an ambient lane of 400-odd entries the file holds the LAST process
+#     and nothing else. Reading it is therefore only sound in a filtered, one-entry lane - which is
+#     why the arming case has a lane and a log of its own below, and why neither this file nor CI
+#     may read the ambient logs as evidence about the entries that ran before the last one. The
+#     ambient path is kept for post-mortems (and to keep library chatter out of ctest's capture).
+# --- G8: the handle ABA, three always-on arms -----------------------------------------
+#
+# ALWAYS ON, in every build mode, which is deliberate: the Legacy arm asserts today's
+# lifetimeId + weak_ptr guards and is meaningful in a pull build, and `ctest -R HandleRecycle`
+# has to name the same entries whichever build directory it is pointed at (P2 brief G8 runs it
+# against build-verify; D.3 part 1 runs it again as part of the interface-purity gate).
+#
+# One lane per arm, and each lane names MGITEST_HANDLE_ARM: the arm is not a property of the
+# test body, it is the (MOBILEGL_PIPE_PUSH, MOBILEGL_PIPE_LEGACY_MEMOS, MOBILEGL_PIPE_HANDLE_ABA_CONTROL)
+# triple the process was launched with, and the scenario skips in the ambient entries because
+# none of that is configured there.
+#
+# Every list APPENDS the common/Vulkan environment for the reason spelled out above the verify
+# block: a ctest ENVIRONMENT property REPLACES the job environment for the names it lists, so an
+# entry naming only its own knobs would lose the EGL vendor and Vulkan ICD pinning.
+#
+# The AbaControl arm is DirectVulkan only. The knob defeats the object-identity half of
+# DirectVulkan's vertex-input memo keys (VertexInputStateFactory::ComputeHash, its per-VAO memo
+# table, and LookupVaoDrawMemo); it steers nothing on DirectGLES, and a lane that configured it
+# there would be a permanent skip claiming to be a control.
+#
+# SO THE BUFFER ABA's CORRUPTION EVIDENCE IS MAGMA-ONLY, AND THAT IS RECORDED RATHER THAN LEFT
+# AS AN ABSENCE (gates m10, closed here as a statement rather than as a lane). P3a re-keys the
+# BUFFER on DirectGLES - resource_* now dispatches by handle - so the obvious next move is a
+# DirectGLES `.AbaControl` lane over ABufferAtARecycledAddressDoesNotInheritItsPredecessorsContents.
+# It is not a registration-only change and it is therefore not made here: the knob has exactly
+# one consumer in the tree (MG_Backend/DirectVulkan/Renderer/MagmaPipeArms.h's
+# MagmaPipeAbaControlDefeatsIdentity, which is what the MGL_ITEST_MAGMA_ABA probe above looks
+# for), so a DirectGLES lane would run with the knob inert, fail to reproduce the corruption it
+# asserts, and go RED in an always-on integration-gpu lane - the exact failure mode the header
+# of HandleRecycleScenario.cpp records this file already having had once.
+#
+# What that costs, stated so the next reader does not have to re-derive it: on DirectGLES the
+# buffer case's Handles arm proves the re-key does NOT alias, and nothing proves the reproducer
+# could still see an aliasing that was reintroduced there. The positive control for that is a
+# Features.PipeHandleAbaControl consumer over Espryt's resource slot table - one `if` in
+# GetOrCreate / FindByHandle, the way MagmaPipeClaimSlotMemos is Magma's - and it belongs with
+# whoever next touches that table, not with a lane registration.
+#
+# It gets TWO lanes, because there are two arms and the control has to reach the one P2 SHIPS.
+# `AbaControl` is D18's lane verbatim (MOBILEGL_PIPE_PUSH=0, the pre-handle arm) and defeats the
+# lifetime-id/address guards; `AbaControlHandles` runs the handle arm (MOBILEGL_PIPE_LEGACY_MEMOS=0,
+# the default push mask) and defeats the object identity that SELECTS THE SLOT - the key the handle
+# arm ships. With only the first lane the control says nothing at all about the re-key: the handle
+# arm is not executed under MOBILEGL_PIPE_PUSH=0, so every guard it would have to defeat is in
+# another branch.
+#
+# NEITHER lane exercises the GENERATION half of {slot, gen}, and no lane of this shape can. Magma's
+# mint has no death notification and returns a slot only through its age sweep (256/1024 boundaries,
+# MagmaPipeArms.h), so the five frame boundaries this scenario issues always hand the replacement a
+# brand-new slot at Gen 1; a real reuse needs >= 1024 idle boundaries, which puts the two draws in
+# different frames - where the only pixel-visible memo declines by design. The generation is covered
+# by the unit suite MG_Test/Pipe/MagmaPipeIdentityTest.cpp instead, which drives a real
+# retire -> reuse; MagmaPipeAbaControlDefeatsIdentity carries the measurement.
+#
+# The two PUSH-ONLY knobs of those arms are set only in a push build, and the lane NAMES are
+# unaffected by that (an ENVIRONMENT property is not part of a test's name, so G2 still sees the
+# same list in both builds). MOBILEGL_PIPE_LEGACY_MEMOS=0 says "never enter the legacy arm"; in a
+# pull build the legacy arm is the ONLY arm and every Track-H subsystem bit is clear, which is
+# precisely D14's startup Fatal{PipeLegacyMemosDisabled} condition - so a lane that set it there
+# would abort the process before the scenario could report its skip. MOBILEGL_PIPE_HANDLE_ABA_CONTROL
+# has no field to parse into in a pull build at all (Config.h declares it under #if MOBILEGL_PIPE_PUSH).
+# A lane that needs an arm pins EVERY knob that selects it. A ctest ENVIRONMENT property overrides
+# only the variables it names; the rest leak in from the job. The five-part gate's all-pull control
+# arm runs `MOBILEGL_PIPE_PUSH=0 ctest -L integration-gpu` over the whole label, and without the
+# explicit bitmask below that leaked PUSH=0 turned this lane's LEGACY_MEMOS=0 into D14's armless
+# combination: the bring-up aborted, on purpose, and the lane went red for a reason that was never
+# about handles. The mask is the PHASE default, not a hand-picked bit, so the lane keeps measuring
+# the shape that ships: it was kMGPipeSubsystemsMigratedAtP2 (0x7f), then
+# kMGPipeSubsystemsMigratedAtP3a (0x1ff), and is now kMGPipeSubsystemsMigratedAtP4a (0x1fff,
+# MG_Pipe/MGPipe.h), which adds bits 9-12 - framebuffer, texture resources, samplers and programs.
+# Pinning it at 0x1ff after P4a would leave the Handles arm asserting the P3a shape while the six
+# OBJECT handles it is now also about stayed switched off - a lane that still passes and no longer
+# measures the key that ships. Each phase's constant survives as the NEXT phase's A/B control, which
+# is what ResourceSubsystemControl's Off lane uses 0x7f for and ObjectSubsystemControl's uses 0x1ff.
+if (MOBILEGL_PIPE_PUSH)
+    set(MGL_ITEST_HANDLES_ARM_KNOBS "MOBILEGL_PIPE_LEGACY_MEMOS=0" "MOBILEGL_PIPE_PUSH=0x1fff")
+    set(MGL_ITEST_ABA_ARM_KNOBS "MOBILEGL_PIPE_HANDLE_ABA_CONTROL=1")
+else()
+    set(MGL_ITEST_HANDLES_ARM_KNOBS "")
+    set(MGL_ITEST_ABA_ARM_KNOBS "")
+endif()
+
+mgl_itest_join_environment(MGL_ITEST_GLES_HANDLE_HANDLES_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_HANDLE_ARM=handles" ${MGL_ITEST_HANDLES_ARM_KNOBS}
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_HANDLES_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=handles" ${MGL_ITEST_HANDLES_ARM_KNOBS}
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_HANDLE_LEGACY_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_HANDLE_ARM=legacy" "MOBILEGL_PIPE_PUSH=0"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_LEGACY_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=legacy" "MOBILEGL_PIPE_PUSH=0"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_ABA_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=aba" "MOBILEGL_PIPE_PUSH=0"
+    ${MGL_ITEST_ABA_ARM_KNOBS}
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_ABA_HANDLES_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=aba"
+    ${MGL_ITEST_HANDLES_ARM_KNOBS} ${MGL_ITEST_ABA_ARM_KNOBS}
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.HandleRecycle.Handles."
+    TEST_FILTER "HandleRecycleScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_HANDLE_HANDLES_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.HandleRecycle.Handles."
+    TEST_FILTER "HandleRecycleScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_HANDLES_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.HandleRecycle.Legacy."
+    TEST_FILTER "HandleRecycleScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_HANDLE_LEGACY_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.HandleRecycle.Legacy."
+    TEST_FILTER "HandleRecycleScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_LEGACY_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.HandleRecycle.AbaControl."
+    TEST_FILTER "HandleRecycleScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_ABA_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.HandleRecycle.AbaControlHandles."
+    TEST_FILTER "HandleRecycleScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_ABA_HANDLES_ENVIRONMENT}"
+)
+
+# --- G12: the CSO content-addressing negative control ---------------------------------
+#
+# PUSH BUILDS ONLY, and that is the honest scope rather than a convenience: the two counters the
+# control reads (CallClass::RenderStateCsoMints / RenderStateCsoBinds) and the `cso[...]` bracket
+# of the summary line are both `#if MOBILEGL_PIPE_PUSH` (PipeStats.h, PipeStats.cpp), so in a pull
+# build there is no channel to read and an entry here would be a permanent skip.
+#
+# Each arm gets a LOG PATH OF ITS OWN. The library opens its log fopen(path, "w") - every process
+# in a lane truncates it - and these two cases READ that log, so a shared path would have them
+# reading a neighbour's bring-up under `ctest -j 4`. Same rule as the arming lane below.
+#
+# MOBILEGL_PIPE_STATS_PERIOD=1 makes one summary line per eglSwapBuffers, which is what lets the
+# workload be bracketed by two swaps and read back as a window covering exactly itself.
+#
+# Registered in EVERY build, including the pull build where there is no CSO at all, so that
+# `ctest -L integration-gpu` stays name-for-name identical between pull and push (gate G2). In a
+# pull build MGITEST_PIPE_PUSH_BUILD is absent and both cases skip saying so.
+#
+# THE MASK IS THE PHASE DEFAULT AND THE CONTROL IS BIT 63, and the two must not be confused. The
+# only thing these four lanes are an A/B about is `no CSO content addressing` (bit 63,
+# kMGPipeBehaviourNoCsoContentAddressing), which is what separates the On lane from the Off lane.
+# Every
+# other bit is the build's shipping mask, so it moves with the phase: 0x7f
+# (kMGPipeSubsystemsMigratedAtP2), then 0x1ff (kMGPipeSubsystemsMigratedAtP3a), now 0x1fff
+# (kMGPipeSubsystemsMigratedAtP4a) for the same reason MGL_ITEST_HANDLES_ARM_KNOBS above moved. Left
+# pinned at 0x1ff after P4a these lanes would keep passing while running on a configuration nothing
+# ships - bits 9-12 (framebuffer, texture resources, samplers, programs) cleared - which is the
+# "still green, no longer measuring the shape that ships" failure the Handles-arm comment above
+# rejects. NOTE THAT THE OFF LANE'S MASK MOVED TOO, from 0x80000000000001ff to
+# 0x8000000000001fff: the mask moves with the phase, the control is bit 63, and the two must not be
+# confused. The counters they read (csom / csob) are render-state and
+# are steered by neither bit, so raising the mask is behaviour-preserving for what they assert;
+# what it buys is that a CSO regression that only shows up with the P3a subsystems on can reach
+# them. (contract-review-v1.md item 11, closed here for all three lane families.)
+mgl_itest_join_environment(MGL_ITEST_GLES_CSO_ON_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_CSO_LANE=content-addressed"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-content-addressed-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_CSO_OFF_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_CSO_LANE=no-content-addressing"
+    "MOBILEGL_PIPE_PUSH=0x8000000000001fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-no-content-addressing-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_CSO_ON_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_CSO_LANE=content-addressed"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-content-addressed-DirectVulkan.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_CSO_OFF_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_CSO_LANE=no-content-addressing"
+    "MOBILEGL_PIPE_PUSH=0x8000000000001fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-no-content-addressing-DirectVulkan.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.CsoContentAddressing.On."
+    TEST_FILTER "CsoContentAddressingScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_CSO_ON_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.CsoContentAddressing.Off."
+    TEST_FILTER "CsoContentAddressingScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_CSO_OFF_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.CsoContentAddressing.On."
+    TEST_FILTER "CsoContentAddressingScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_CSO_ON_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.CsoContentAddressing.Off."
+    TEST_FILTER "CsoContentAddressingScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_CSO_OFF_ENVIRONMENT}"
+)
+
+# --- G12: the P3a subsystem A/B, and G10's map-persistent-roundtrips lanes ------------
+#
+# THE MASKS ARE PHASE CONSTANTS, not hand-picked bits: 0x1fff is
+# kMGPipeSubsystemsMigratedAtP4a (the push build's default as of P4a) and 0x7f is
+# kMGPipeSubsystemsMigratedAtP2, which is that default with bits 7 (resources), 8 (vertex input)
+# and 9-12 (P4a's four object families) cleared. MGPipe.h keeps each phase's constant alive as the
+# next phase's A/B control for this reason, and a lane that spelled its own bit pattern would stop
+# being the shape that ships the first time the default moved. THE ON LANE MOVED TO 0x1fff WITH THE
+# PHASE and the OFF LANE'S 0x7f DID NOT: this A/B is about bit 7, and pinning its On arm at 0x1ff
+# after P4a would measure the resource emitter on a configuration nothing ships. P4a's own A/B -
+# 0x1fff against 0x1ff - is ObjectSubsystemControl's, further down.
+#
+# DirectGLES only. P3a migrates Espryt's buffer and VAO paths; Magma's buffer path is P7 and
+# registers no MGPipeResourceOps, so a DirectVulkan arm would be measuring the client emitter
+# against a backend nobody asked to change.
+#
+# Each reading entry gets a LOG PATH OF ITS OWN, and its ctest entry selects ONE case: the library
+# opens the log fopen(path, "w") - every process in a lane truncates it - and these cases READ it.
+# Two readers in one lane race under `ctest -j`, and the failure looks exactly like "the counter
+# was never emitted". Same rule as the CSO lanes above and the verify arming lane below.
+#
+# MOBILEGL_PIPE_STATS_PERIOD=1 makes one summary line per eglSwapBuffers, which is what lets a
+# workload be bracketed by two swaps and read back as a window covering exactly itself.
+#
+# Registered in EVERY build, including the pull build where none of the counters exists, so that
+# `ctest -L integration-gpu` stays name-for-name identical between pull and push (gate G2). In a
+# pull build MGITEST_PIPE_PUSH_BUILD is absent and every one of these cases skips saying so; a
+# MOBILEGL_PIPE_PUSH value in the environment of a pull library steers nothing (Config.h declares
+# the field inside the push guard), exactly as the HandleRecycle Legacy lanes already rely on.
+mgl_itest_join_environment(MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_ON_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_RESOURCE_SUBSYSTEM_LANE=on"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/resource-subsystem-on-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_OFF_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_RESOURCE_SUBSYSTEM_LANE=off"
+    "MOBILEGL_PIPE_PUSH=0x7f" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/resource-subsystem-off-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ResourceSubsystemControl.On."
+    TEST_FILTER "ResourceSubsystemControlScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_ON_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ResourceSubsystemControl.Off."
+    TEST_FILTER "ResourceSubsystemControlScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_OFF_ENVIRONMENT}"
+)
+
+# G10's two counting entries, one per scenario that has a claim about the counter:
+# StorageBufferRegrow asserts N definitions cost N round trips (never one per draw), and
+# LargeArenaAdoption asserts one adoption costs exactly one. Each names a single case in its
+# TEST_FILTER, for the private-log reason above.
+mgl_itest_join_environment(MGL_ITEST_GLES_MPR_REGROW_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_MPR_LANE=storage-buffer-regrow"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/mpr-storage-buffer-regrow-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_MPR_ARENA_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_MPR_LANE=large-arena-adoption"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/mpr-large-arena-adoption-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.MapPersistentRoundtrips."
+    TEST_FILTER "StorageBufferRegrowScenario.NStorageDefinitionsCostNMapPersistentRoundtripsNotOnePerDraw"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_MPR_REGROW_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.MapPersistentRoundtrips."
+    TEST_FILTER "LargeArenaAdoptionScenario.AnAdoptionCostsExactlyOneMapPersistentRoundtrip"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_MPR_ARENA_ENVIRONMENT}"
+)
+
+# LargeArenaAdoption's three behavioural cases under BOTH arms of the same A/B. This file is where
+# an adopted store's whole life is exercised - the NULL-data definition that adopts it, an
+# in-flight SubData, a readback and a GPU write - so if the handle path and the legacy
+# BufferBackendOps path disagree about any of it, one of these two lanes goes red and names which.
+# No log path: none of these three cases reads one, and giving them one would only add a file for
+# four processes to truncate. The fourth case skips in both lanes for exactly that reason, saying
+# so.
+mgl_itest_join_environment(MGL_ITEST_GLES_ARENA_SUBSYSTEM_ON_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_PUSH=0x1fff"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_ARENA_SUBSYSTEM_OFF_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_PUSH=0x7f"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ResourceSubsystemOn."
+    TEST_FILTER "LargeArenaAdoptionScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_ARENA_SUBSYSTEM_ON_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ResourceSubsystemOff."
+    TEST_FILTER "LargeArenaAdoptionScenario.*"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_ARENA_SUBSYSTEM_OFF_ENVIRONMENT}"
+)
+
+# --- G12: the P4a subsystem A/B, and its dependency refusal ---------------------------
+#
+# THE MASKS ARE THE TWO PHASE CONSTANTS, exactly as the P3a block above: 0x1fff is
+# kMGPipeSubsystemsMigratedAtP4a (the push build's default) and 0x1ff is
+# kMGPipeSubsystemsMigratedAtP3a, which is that default with bits 9 (framebuffer), 10 (texture
+# resources), 11 (samplers) and 12 (programs) cleared. THIS is the phase's "new 0x1ff off-lane": the
+# constant P3a shipped survives as P4a's A/B control, and a lane that spelled its own bit pattern
+# would stop being the shape that ships the first time the default moved.
+#
+# THE THIRD AND FOURTH LANES ARE THE DEPENDENCY REFUSALS (D-K2) and they are the entries in this
+# family that are not vacuous before the emitters land, because both are decisions made from the
+# bitmask alone. A half-honoured mask is invisible in the pixels by construction, which is why each
+# needs an entry rather than a code comment.
+#
+#   0x9ff sets the sampler subsystem (bit 11) WITHOUT the texture resource subsystem (bit 10) that
+#         every MGPBoundView::Texture and MGPImageView::Res depends on.
+#   0x5ff sets the texture resource subsystem (bit 10) WITHOUT the sampler subsystem (bit 11):
+#         D-K2's fourth row (ID-15). MGPTextureParams::BuiltinSampler is a SamplerCso handle and
+#         only bit 11 mints sampler CSOs, so bit 10 alone would emit a null there and the applier's
+#         Fatal is the next thing that happens. The brief called this pair harmless; P4a as built
+#         says otherwise, and the refusal belongs in the texture family's arm resolver.
+#
+# In both, the bring-up must log ONE error naming both bits and run the legacy arm.
+#
+# ONE CASE PER LANE, through TEST_FILTER, and it is a constraint rather than a preference: each case
+# READS the library's log and the log is a per-LANE resource (the library opens it fopen(path, "w"),
+# so every process in a lane truncates it). Two entries in one lane race under `ctest -j` with a
+# failure indistinguishable from "the counter was never emitted". Same rule as the CSO lanes, the
+# map-persistent lanes and the verify arming lane.
+#
+# THE FIRST FOUR LANES ARE DirectGLES ONLY. P4a migrates Espryt's framebuffer, texture, sampler
+# and program paths; Magma's are P7 and register nothing here, so a DirectVulkan lane that measured
+# the emit[] bracket would be measuring the client emitters against a backend nobody asked to
+# change.
+#
+# THE FIFTH AND SIXTH LANES INVERT THAT, and the inversion is the point (c0f, ID-39/ID-40). "Magma
+# registers no consumer" stopped being a reason to have no lane the moment it became a THING THE
+# CLIENT MUST CHECK: P4a's families were wired without P3a's "a backend registered
+# MGPipeResourceOps" conjunct, so on Magma the client emitted, the applier ACCEPTED, the client
+# cleared its dirty flags on that acceptance and Magma's legacy path found nothing to upload - 66
+# DirectVulkan cases red, every one of them texture-upload shaped, every one of them green at
+# 0x1ff. The fix's belt (the applier refusing and counting RefusedNoConsumer) is invisible in
+# pixels and invisible in the emit[] bracket, so it needs its own entry, and it needs it on the
+# backend WITHOUT the consumer. The DirectGLES twin is the control that keeps the assertion from
+# being vacuously true of a tree where nothing emits anywhere.
+#
+# Both run at the PHASE DEFAULT (0x1fff) rather than a hand-picked mask, for the reason the whole
+# block gives: the shape that ships is the shape worth measuring.
+#
+# Registered in EVERY build, including the pull build where none of the counters exists, so that
+# `ctest -L integration-gpu` stays name-for-name identical between pull and push (gate G2). In a
+# pull build MGITEST_PIPE_PUSH_BUILD is absent and every one of these cases skips saying so.
+mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_ON_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=on"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-on-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_OFF_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=off"
+    "MOBILEGL_PIPE_PUSH=0x1ff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-off-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=refused"
+    "MOBILEGL_PIPE_PUSH=0x9ff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-refused-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_TEXTURE_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=refused-texture"
+    "MOBILEGL_PIPE_PUSH=0x5ff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-refused-texture-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_CONSUMER_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=consumer"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-consumer-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+mgl_itest_join_environment(MGL_ITEST_VULKAN_OBJECT_SUBSYSTEM_NO_CONSUMER_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_OBJECT_SUBSYSTEM_LANE=no-consumer"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-no-consumer-DirectVulkan.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ObjectSubsystemControl.On."
+    TEST_FILTER "ObjectSubsystemControlScenario.ClearingTheP4aBitsStopsTheEmissionsAndNotThePixels"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_ON_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ObjectSubsystemControl.Off."
+    TEST_FILTER "ObjectSubsystemControlScenario.ClearingTheP4aBitsStopsTheEmissionsAndNotThePixels"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_OFF_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ObjectSubsystemControl.Refused."
+    TEST_FILTER "ObjectSubsystemControlScenario.ASamplerBitWithoutTheTextureBitIsRefusedAndNamed"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ObjectSubsystemControl.RefusedTexture."
+    TEST_FILTER "ObjectSubsystemControlScenario.ATextureBitWithoutTheSamplerBitIsRefusedAndNamed"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_TEXTURE_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.ObjectSubsystemControl.Consumer."
+    TEST_FILTER "ObjectSubsystemControlScenario.TheAppliersNoConsumerBeltNeverFiresBehindTheClientsGate"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_CONSUMER_ENVIRONMENT}"
+)
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectVulkan.ObjectSubsystemControl.NoConsumer."
+    TEST_FILTER "ObjectSubsystemControlScenario.TheAppliersNoConsumerBeltNeverFiresBehindTheClientsGate"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_VULKAN_OBJECT_SUBSYSTEM_NO_CONSUMER_ENVIRONMENT}"
+)
+
+# --- The texture upload shape: RECORDED, NOT GATED in P4a (D-D4) ----------------------
+#
+# SSIM is blind to the box-versus-rect upload shape and the Mali cliff it hides is ~+6 ms/frame, so
+# the shape needs a number - two numbers, in fact, the server's tex[emit= box= rect= jobs=] and the
+# client's emit[ctu=], which agreeing is the whole reason both are published (D-L). What this lane
+# asserts is that the numbers could be READ, that the server bracket's own arithmetic holds and that
+# the two sides agree when both are non-zero; WHICH shape each texture took is RecordProperty'd and
+# printed for MEASUREMENTS.md. P3b/P4b turns it into a gate against a gold standard, with the Mali
+# frame-time delta published beside it - gating a shape this phase has not finished deciding would
+# either pin today's shape as the answer or fail on the change that is the next phase's point.
+#
+# Its own log path and its own single-case filter, for the per-lane-log reason above.
+mgl_itest_join_environment(MGL_ITEST_GLES_TEXTURE_UPLOAD_SHAPE_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_TEXTURE_UPLOAD_SHAPE_LANE=1"
+    "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/texture-upload-shape-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.TextureUploadShape."
+    TEST_FILTER "TextureUploadShapeScenario.TheEmittedUploadShapeIsRecordedAndTheTwoSidesAgree"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_TEXTURE_UPLOAD_SHAPE_ENVIRONMENT}"
+)
+
+# --- G9: the mandatory red-before scenario -------------------------------------------
+#
+# TextureParamsWithoutASamplerViewScenario needs NO lane of its own, and that is deliberate rather
+# than an omission. It reads no counter and no log - its observable is a sampled colour - and its
+# claim is about the SHIPPING configuration, so the two ambient registrations at the top of this
+# file (which run at the build's default mask) are exactly the arms it wants. A lane here would pin
+# a mask and make the entry stop describing what ships the next time the default moved. The
+# DirectVulkan ambient entries skip in the scenario's SetUp, naming the backend: the gap it is about
+# is Espryt's SyncAttachmentObject / SyncNeccessaryTextures pair and P4a touches no DirectVulkan
+# source but MagmaPipeArms.h (D-Q).
+#
+# D-E3 expects its second case, AReadAttachmentOnlyTexturesDepthStencilModeReachesTheDriver, to be
+# RED until package esprytobj lands. MEASURED ON THE CONTRACT COMMIT IT IS GREEN, and the scenario's
+# header carries the mechanism: a texture parameter's only public-GL observable is a sample, and the
+# sample repairs the state it was meant to catch (the unit sync list re-syncs whenever the params
+# version moved). Nothing about any of that is expressed in this file - a registration that
+# "expected" a red would be a gate that could never go green - and the ruling on the missing
+# artefact is the integrator's, recorded in the gates result document.
+
+if (MOBILEGL_PIPE_VERIFY)
+    # 900s, not the ambient 120: the comparator re-reads every field of the fill mask at the verb
+    # boundary and again at every accessor read, which the design budgets at 5-10x.
+    set(MGL_ITEST_VERIFY_TIMEOUT 900)
+
+    mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-DirectGLES.log"
+        ${MGL_ITEST_COMMON_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-DirectVulkan.log"
+        ${MGL_ITEST_VULKAN_ENV})
+
+    # The arming assertion's own lane, one case per backend, with a log path nothing else writes to.
+    #
+    # PipeVerifyArmingScenario.Armed reads the library's log, and the log is a per-LANE resource: it
+    # is opened fopen(path, "w"), so every process in a lane truncates it. In the ambient Verify.
+    # lane that is 400-odd processes on one path, run `-j 4` in CI, and a whole-file read there
+    # races a neighbour's bring-up. Every other log-reading scenario in this file (UnlocatedIoBlocks,
+    # the primgen reroute, the point-size demotion) is registered exactly like this for the same
+    # reason. MGITEST_PIPE_ARMING_LANE is a harness marker - the library never reads it - and it is
+    # what makes the case skip in the ambient lane instead of racing there.
+    mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_ARMING_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1" "MGITEST_PIPE_ARMING_LANE=1"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-arming-DirectGLES.log"
+        ${MGL_ITEST_COMMON_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_ARMING_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1" "MGITEST_PIPE_ARMING_LANE=1"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-arming-DirectVulkan.log"
+        ${MGL_ITEST_VULKAN_ENV})
+
+    # Negative control A (G4). MOBILEGL_PIPE_VERIFY_FATAL=0 so the process SURVIVES its own
+    # divergence and the case can read the report back out of the log; the CI step that exports
+    # the same corruption against the ambient lane, where FATAL keeps its default of 1, asserts
+    # the other half - that a divergence aborts and reds the entry.
+    mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_CORRUPT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1"
+        "MOBILEGL_PIPE_VERIFY_CORRUPT=GetRenderStateParameters" "MOBILEGL_PIPE_VERIFY_FATAL=0"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-corrupt-DirectGLES.log"
+        ${MGL_ITEST_COMMON_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_CORRUPT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1"
+        "MOBILEGL_PIPE_VERIFY_CORRUPT=GetRenderStateParameters" "MOBILEGL_PIPE_VERIFY_FATAL=0"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-corrupt-DirectVulkan.log"
+        ${MGL_ITEST_VULKAN_ENV})
+
+    # Negative control B (G5). The omission skips the STAMP of one field for one verb while still
+    # copying its value, which is indistinguishable from a fill row nobody wrote; the scenario
+    # forks, so the resulting std::abort() is a datum in waitpid() rather than a dead lane.
+    mgl_itest_join_environment(MGL_ITEST_GLES_POISON_OMIT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1"
+        "MOBILEGL_PIPE_POISON_OMIT=GenerateMipmap:GetActiveTextureUnit"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-poison-omit-DirectGLES.log"
+        ${MGL_ITEST_COMMON_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_POISON_OMIT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1"
+        "MOBILEGL_PIPE_POISON_OMIT=GenerateMipmap:GetActiveTextureUnit"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-poison-omit-DirectVulkan.log"
+        ${MGL_ITEST_VULKAN_ENV})
+
+    # The whole suite again, per backend, with the comparator armed. Same scenarios, same
+    # assertions, but every backend read of frontend state is now checked against a snapshot taken
+    # from the live context at the verb boundary - which is what "the 742 integration entries
+    # prove push equals pull" means. Labelled integration-gpu as well so a verify build's
+    # `ctest -L integration-gpu` still describes the whole registration set.
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Verify."
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectVulkan.Verify."
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_ENVIRONMENT}"
+    )
+
+    # The arming assertion, one entry per backend. This is the entry that fails a lane whose library
+    # never armed: it runs the same library and the same MOBILEGL_PIPE_VERIFY=1 as the ambient
+    # entries above, but unlike them it cannot be green against a library with no comparator
+    # compiled in. Its log is its own, so `-j 4` cannot make it flake.
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.VerifyArming."
+        TEST_FILTER "PipeVerifyArmingScenario.Armed"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_ARMING_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectVulkan.VerifyArming."
+        TEST_FILTER "PipeVerifyArmingScenario.Armed"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_ARMING_ENVIRONMENT}"
+    )
+
+    # One case each: the knobs are process-wide, so a corrupted or poisoned process cannot also be
+    # running the ambient assertions. These four entries are the ones that assert the RED - they
+    # pass when the comparator and the poison report, and go red when either stops.
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.VerifyCorrupted."
+        TEST_FILTER "PipeVerifyArmingScenario.CorruptedFieldIsReported"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_CORRUPT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectVulkan.VerifyCorrupted."
+        TEST_FILTER "PipeVerifyArmingScenario.CorruptedFieldIsReported"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_CORRUPT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.PoisonOmitted."
+        TEST_FILTER "PoisonOmissionScenario.OmittedFieldAbortsOnThatVerb"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_POISON_OMIT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectVulkan.PoisonOmitted."
+        TEST_FILTER "PoisonOmissionScenario.OmittedFieldAbortsOnThatVerb"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-verify"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_VULKAN_POISON_OMIT_ENVIRONMENT}"
+    )
+endif()
+
+# --- P5: the DirectGLES.Split. lanes and the persistent-map ARM lanes ------------------------
+#
+# THE PRIVATE SECOND LABEL IS WHAT MAKES THE LANE FALSIFIABLE, and it is the verify block above
+# copied verbatim for the same argument: `ctest -L integration-split --no-tests=error` in a build
+# that forgot -DMOBILEGL_BUILD_DISAGGREGATED=ON matches NOTHING and FAILS, instead of reporting a
+# green run of zero entries. Keeping `integration-gpu` as well is why "a split build's
+# `ctest -L integration-gpu` still describes the whole registration set" stays true.
+#
+# REGISTERED INSIDE `if (MOBILEGL_BUILD_DISAGGREGATED)`, and that is what keeps gate G2 (pull and
+# push name-for-name identical) untouched: neither of those two builds sets the option, so the
+# Split family is absent from BOTH of them rather than present in one. The two SCENARIO FILES the
+# lanes point at are added to the source list unconditionally, so their cases DO appear in the
+# ambient DirectGLES./DirectVulkan. registrations of every build - they are ordinary GL scenarios
+# and their monolith behaviour is the baseline the split arm is compared against.
+#
+# WHAT ARMS THE SPLIT LANES, AND WHY IT IS NOT A PROBE OVER SOURCE TEXT.
+#
+# Until a real client session exists, MOBILEGL_TRANSPORT=inproc is parsed (CONTRACT-P5 5) and then
+# nothing consumes it, so a Split entry would go green having run monolith end to end - the exact
+# failure the lane exists to prevent. The first version of this file answered "has the client
+# landed" with a CMake conjunction over c0's stub files: the c1 symbols present AND no
+# `Fatal.Unimplemented` surviving. REVIEW FINDING M-1 FALSIFIED IT BY PERFORMING IT - a
+# `sed -i 's/Fatal{Unimplemented/Fatal{NotYetImplemented/'` over c0's six stubs, with every entry
+# point still aborting and ImplementedVerbCount() still 0, armed all eleven lanes and EIGHT WENT
+# GREEN. A single comment line carrying the marker did the opposite and would keep them dark
+# forever (M-2), and two stub files outside the two probed directories allowed a partial arm (M-3).
+#
+# A statement about source text can always be falsified by editing source text, and the people
+# most likely to edit it are the ones landing the packages the probe watches for. So the arming
+# condition moved into the PROCESS: Harness/SplitRuntimePeek.cpp reads MG_Config::Transport,
+# ClientSession::Active() and ImplementedVerbCount() - three values c0 shipped and documented,
+# none of which a message edit can move - and every Split case skips, naming the first one that is
+# not true. All this file has to decide now is whether that peek can be COMPILED, which is exactly
+# "did this build compile MG_Remote", which is exactly the build option.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_compile_definitions(MobileGLIntegrationTest PRIVATE -DMGITEST_SPLIT_RUNTIME_PEEK=1)
+    message(STATUS "Integration tests: the DirectGLES.Split. lanes arm from the RUNNING PROCESS - "
+                   "MG_Config::Transport, ClientSession::Active() and ImplementedVerbCount() - and "
+                   "skip naming the first of those that is not true")
+endif()
+
+# Q-3, made a build fact rather than documentation. ConfigLoader logs the resolved transport at
+# INFO, and that line is what run_trace_case.cmake reads back as proof a retrace really went
+# split. At WARN or above it is compiled out and every split retrace reds for a reason that is not
+# a defect; at DEBUG, ConfigLoader's unconditional env dump prints a confusable KEY=VALUE line in
+# a PULL build too (review M-5, also fixed on the reading side). The integration lanes themselves
+# no longer depend on the log level at all - they read the variable - so this is a WARNING.
+if (MOBILEGL_BUILD_DISAGGREGATED AND DEFINED MOBILEGL_LOG_ACTIVE_LEVEL
+    AND NOT MOBILEGL_LOG_ACTIVE_LEVEL STREQUAL "MOBILEGL_LOG_LEVEL_INFO"
+    AND NOT MOBILEGL_LOG_ACTIVE_LEVEL STREQUAL "MOBILEGL_LOG_LEVEL_DEBUG")
+    message(WARNING "Integration tests: MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL} in a "
+                    "disaggregated build. ConfigLoader's transport line is MGLOG_I, so the "
+                    "trace-replay split arm's transport-resolution assertion cannot see it and every "
+                    "split retrace will red. Use MOBILEGL_LOG_LEVEL_INFO.")
+endif()
+
+# Package b1's client-side persistent-map tracker, which is what Harness/PersistentMapPeek.cpp
+# asks the membership question of (b1-v1.md 4.1 item 2). TWO halves, and both are needed:
+# MOBILEGL_BUILD_DISAGGREGATED because a build that never compiled MG_Remote cannot LINK the call,
+# and the content probe because b1 may not have landed it yet. __has_include in the peek would
+# answer yes in a pull build - the header is in the source tree of every build - and turn a
+# healthy pull build into a link error, which is why this decision is made here.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    mgl_itest_probe_for_symbol(MGL_ITEST_PERSISTENT_MAP_TRACKER
+        "${MGL_ITEST_ROOT}/MobileGL/MG_Remote/Client" "IsLivePersistentMap")
+    if (MGL_ITEST_PERSISTENT_MAP_TRACKER)
+        message(STATUS "Integration tests: package b1's persistent-map tracker is present "
+                       "(${MGL_ITEST_PERSISTENT_MAP_TRACKER}) - PersistentCoherentMapScenario's "
+                       "membership assertion is live")
+        target_compile_definitions(MobileGLIntegrationTest PRIVATE -DMGITEST_PERSISTENT_MAP_TRACKER=1)
+    else()
+        message(STATUS "Integration tests: no source under MobileGL/MG_Remote/Client names "
+                       "IsLivePersistentMap - package b1's tracker has not landed, so "
+                       "PersistentCoherentMapScenario's membership assertion SKIPS")
+    endif()
+endif()
+
+# ARCHITECTURE.md:543 - every new ctest ENVIRONMENT and add_trace_replay_test's SPLIT branch
+# carries MOBILEGL_IPC_SERVER_PATH, because the dladdr fallback cannot find the server from a
+# binary that links MobileGL_s statically. P5 is inproc-only and nothing reads the value yet; it
+# is carried now so that an unparsed variable and a parsed-and-ignored one stop being
+# indistinguishable the day P6 consumes it. A generator expression is deliberately NOT used here:
+# a $<TARGET_FILE_DIR:...> inside a gtest_discover_tests PROPERTIES value is written into the
+# generated ctest include file verbatim and never expanded.
+set(MGL_ITEST_SPLIT_SERVER_PATH "${CMAKE_BINARY_DIR}/libMobileGLServer.so")
+
+mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+    "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+# The two counting lanes, one per transport, and they are a PAIR: exit gate E3(c) asks that the
+# split arm's `mpr` equal the monolith arm's, and one test process can only ever see its own. So
+# both lanes run the same workload and assert the same constant, and the equality holds by
+# construction with each half able to fail on its own.
+#
+# Each gets a LOG PATH OF ITS OWN and a TEST_FILTER that selects ONE case, for the reason
+# PipeStatsWindow.h gives: the library opens its log fopen(path, "w"), so every process in a lane
+# truncates it, and two readers in one lane race under `ctest -j`. RESOURCE_LOCK on top of that,
+# for the reason the UnlocatedIoBlocks lane gives - measured on this tree, three runs of the full
+# integration-gpu label at -j 8 produced 4, 0 and 2 spurious failures of the log-reading cases
+# without it.
+#
+# The monolith lane declares NO arm: which arm AcquireMemoryRange takes for a sub-16-MiB
+# PERSISTENT|WRITE|COHERENT map is a property of the driver and the build, so the case RECORDS it
+# there and skips the assertion. Only the split lane - where R-6 pins the adopt tier at T2 -
+# declares one.
+# MOBILEGL_TRANSPORT=monolith IS NAMED HERE ON PURPOSE, and it is review finding N-6. This entry
+# is the MONOLITH half of a pair; without the property a job-level or gate-level
+# `MOBILEGL_TRANSPORT=inproc` export reaches it (observed: its own log then carried
+# `Config: MOBILEGL_TRANSPORT=inproc`) and, in the inproc arm of the three-arm A/B, BOTH halves of
+# the pair were inproc. Nothing failed - each half asserts the same constant - but the pair was
+# not the pair its name describes. A ctest ENVIRONMENT property overrides the job environment,
+# which is the one case where that is what you want.
+mgl_itest_join_environment(MGL_ITEST_GLES_PMAP_ARM_ENVIRONMENT
+    "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_PMAP_LANE=1" "MOBILEGL_TRANSPORT=monolith"
+    "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/persistent-map-arm-DirectGLES.log"
+    ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES.PersistentMapArm."
+    TEST_FILTER "PersistentCoherentMapScenario.TheMapLandsInTheArmItsLaneDeclares"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES
+        LABELS integration-gpu
+        TIMEOUT ${MGL_ITEST_TIMEOUT}
+        RESOURCE_LOCK persistent-map-arm-DirectGLES.log
+        ENVIRONMENT "${MGL_ITEST_GLES_PMAP_ARM_ENVIRONMENT}"
+)
+
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    # One block per scenario, following the DirectGLES.MapPersistentRoundtrips. precedent: a
+    # `:`-separated multi-pattern TEST_FILTER is not used anywhere in this file, so its escaping
+    # through gtest_discover_tests' flat PROPERTIES forwarding is unproven, and three blocks cost
+    # nothing.
+    #
+    # ClearThenReadPixelsScenario is target A of the reduced path and already existed; Triangle is
+    # target B and PersistentCoherentMap is target C, both new in P5.
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split."
+        TEST_LIST MGL_SPLIT_CLEAR_TESTS
+        TEST_FILTER "ClearThenReadPixelsScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split."
+        TEST_LIST MGL_SPLIT_TRIANGLE_TESTS
+        TEST_FILTER "TriangleScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split."
+        TEST_LIST MGL_SPLIT_PMAP_TESTS
+        TEST_FILTER "PersistentCoherentMapScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+    )
+
+    # ---- P5b d1: the indexed / instanced / multi-draw / indirect draw family under inproc ----
+    #
+    # One block per scenario, the precedent above. IndexedDrawFamilyScenario is d1's own lane
+    # case: every case's picture depends on a d1 draw (an element-buffer glDrawElements, a
+    # client index array, a base vertex, the Minecraft trace's DrawElementsInstancedBaseVertex,
+    # the two multi-draws, an indirect draw), so a record that did not cross is a wrong picture
+    # and not a green. MultiDrawScenario, DrawParametersScenario and PrimitiveRestartScenario are
+    # the census's own DrawElements / MultiDrawElementsBaseVertex / DrawArraysInstancedBaseInstance
+    # / MultiDraw*Indirect* first-blocker scenarios, now at their pictures. The ONE case excluded
+    # by filter is MultiDrawScenario's ClientSideIndicesBatchMatchesUnrolledDraws: a multi-draw
+    # with client-side indices is refused BY NAME under split (Fatal{UnmigratedVerb,
+    # "MultiDrawElementsBaseVertex+CLIENT_INDICES"}, CONTRACT-P5B.md d1 - P8's HostResolve.cpp
+    # flattens it), which is its next first blocker and not a lane failure. It is listed in
+    # d1-v1.md, not deleted (G14). GuiBatchScenario (the census's other DrawElements scenario) is
+    # NOT registered: past its draws it stops at Fatal{UnmigratedVerb, "MemoryBarrier"}, which is
+    # i1's to flip; i1 registers it when that lands.
+    set(MGL_SPLIT_D1_SCENARIOS IndexedDrawFamilyScenario MultiDrawScenario DrawParametersScenario
+                               PrimitiveRestartScenario)
+    set(MGL_SPLIT_D1_FILTER_IndexedDrawFamilyScenario "IndexedDrawFamilyScenario.*")
+    set(MGL_SPLIT_D1_FILTER_MultiDrawScenario
+        "MultiDrawScenario.*-MultiDrawScenario.ClientSideIndicesBatchMatchesUnrolledDraws")
+    set(MGL_SPLIT_D1_FILTER_DrawParametersScenario "DrawParametersScenario.*")
+    set(MGL_SPLIT_D1_FILTER_PrimitiveRestartScenario "PrimitiveRestartScenario.*")
+    foreach(mglItestD1Scenario IN LISTS MGL_SPLIT_D1_SCENARIOS)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.Split."
+            TEST_LIST "MGL_SPLIT_D1_${mglItestD1Scenario}_TESTS"
+            TEST_FILTER "${MGL_SPLIT_D1_FILTER_${mglItestD1Scenario}}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-split"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+        )
+    endforeach()
+
+    # ---- P5b package i1 (MG_Remote/CONTRACT-P5B.md §2 i1) --------------------------------
+    #
+    # THE LANE CASE THAT PROVES THE RECORDS CROSSED, and it is a RESULT and not a probe (R-16:
+    # a probe may not arm against a stub). Each of these four scenarios asserts a value that
+    # only exists if the verb ran on the apply thread - the texel a compute shader stored
+    # through an image unit, the word glCopyImageSubData moved, the counter an atomic add left
+    # behind, the block a program pipeline rebound - so a sink that DECLINED, or a client that
+    # fell through to the driver, is red by the number it reads back and not by a tally.
+    #
+    # Before i1 every one of these aborted at the client's Fatal{UnmigratedVerb} on the first
+    # glBindImageTexture / glDispatchCompute / glCopyImageSubData / glShaderStorageBlockBinding;
+    # all four are green under inproc now (the census: 13 + 6 + 11 + 3 DirectGLES entries).
+    # RED ONCE BY DOING X: return false from ServerVerbSink::OnLaunchGrid before the
+    # gl.DispatchCompute call and UnboundImageDescriptor / AtomicCounter / ProgramPipeline all
+    # read back their initial values.
+    #
+    # THE FILTERS ARE NARROWED TO THE CASES THAT ACTUALLY EMIT, and that is ScenarioFixture's
+    # rule rather than a convenience: an armed `DirectGLES.Split.` case must move the client
+    # encoder's record ordinal (ScenarioFixture.h:86), because a lane whose workload produced no
+    # record is the "resolved the transport and then fell through to the driver" shape that
+    # every pixel assertion is blind to. ProgramPipelineScenario's other nine cases are pure
+    # name/state cases that draw nothing, so the whole-scenario filter would arm them and they
+    # would be red for having nothing to say. The two named here are the ones that were
+    # Fatal{UnmigratedVerb, "ShaderStorageBlockBinding"} on the c0b head.
+    #
+    # One block per scenario, following the three above: a `:`-separated multi-pattern
+    # TEST_FILTER is unproven through gtest_discover_tests' flat PROPERTIES forwarding.
+    set(MGL_SPLIT_I1_SCENARIOS
+        UnboundImageDescriptorScenario   # bind_shader_image (72) + launch_grid (60), 13 cases
+        CopyImageLayeredScenario         # resource_copy_region (53), 6 cases
+        AtomicCounterScenario            # launch_grid (60) + memory_barrier (61), 3 cases
+        ProgramPipelineScenario)         # set_storage_block_binding (75), the 2 storage-block cases
+    set(MGL_SPLIT_I1_FILTER_UnboundImageDescriptorScenario "UnboundImageDescriptorScenario.*")
+    set(MGL_SPLIT_I1_FILTER_CopyImageLayeredScenario       "CopyImageLayeredScenario.*")
+    set(MGL_SPLIT_I1_FILTER_AtomicCounterScenario          "AtomicCounterScenario.*")
+    set(MGL_SPLIT_I1_FILTER_ProgramPipelineScenario        "ProgramPipelineScenario.*StorageBlock*")
+    foreach(mglItestI1Scenario IN LISTS MGL_SPLIT_I1_SCENARIOS)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.Split."
+            TEST_LIST "MGL_SPLIT_I1_${mglItestI1Scenario}_TESTS"
+            TEST_FILTER "${MGL_SPLIT_I1_FILTER_${mglItestI1Scenario}}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-split"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+        )
+    endforeach()
+
+    # ---- P5b t2: the transform-feedback spans, the XFB object bind, the patch parameter -------
+    #
+    # MG_Remote/CONTRACT-P5B.md §2 t2. The three P5 lanes above are the REDUCED PATH's targets
+    # (a clear, a triangle, a persistent map); these two are the first lane entries whose GREEN
+    # DEPENDS ON A t2 RECORD HAVING CROSSED AND BEEN APPLIED BY THE BACKEND, which is the only
+    # statement a package flipping a verb can make that a unit case cannot:
+    #
+    #   TessellationXfbCaptureScenario  covers BOTH halves of t2 in one workload. Every case
+    #       calls glPatchParameteri(GL_PATCH_VERTICES, n) and then draws GL_PATCHES into a
+    #       transform-feedback capture, and asserts the CAPTURED BYTES. A patch_parameter (73)
+    #       that did not reach the server tessellates at the previous patch size and the capture
+    #       is the wrong length; a begin/end_stream_output (62/63) that did not reach it leaves
+    #       the buffer holding the scenario's poison value, which is what those cases print.
+    #   XfbCaptureBufferReuseScenario   is the span family alone, across four buffer lifetimes
+    #       (a buffer per span, one immutable-storage buffer, one respecified buffer, a
+    #       respecification that changes the capture size). It is the case that would notice a
+    #       span whose END crossed but whose BEGIN did not, because the second span's bytes
+    #       would be the first span's.
+    #
+    # Both are DirectGLES only, deliberately, and the reason is measured rather than assumed:
+    # under Magma the capture is written into the server's resident slice and there is no route
+    # back, because MG_Backend/Init.cpp's ConsumedSubsystemsFor(DirectVulkan) withholds
+    # kMGPipeSubsystemResources, so BufferObject::SyncGpuWrites() emits no resource_readback.
+    # Every DirectVulkan XFB capture entry in the inproc census fails on exactly that (t2-v1.md
+    # §"the 51"), and it retires with P7 (Magma's resource family) / P9 (the readback carrier) -
+    # not here. A DirectVulkan arm of this lane would be red for a reason t2 cannot fix.
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split."
+        TEST_LIST MGL_SPLIT_T2_TESS_TESTS
+        TEST_FILTER "TessellationXfbCaptureScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split."
+        TEST_LIST MGL_SPLIT_T2_XFB_TESTS
+        TEST_FILTER "XfbCaptureBufferReuseScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+    )
+
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split."
+        TEST_LIST MGL_SPLIT_SYNC_TESTS
+        TEST_FILTER "SyncWireScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+    )
+
+    # The split half of the counting pair. MGITEST_PERSISTENT_MAP_ARM=emulated is R-6: under split
+    # the adopt tier is pinned at T2, the resource owner declines every acquisition and the client
+    # pushes the mapping's dirty blocks - so pmap must be non-zero and mpr must be the monolith
+    # lane's number. pmap == 0 here means MGPipeApplyMapPersistent handed back a pointer, which is
+    # exit gate E3(d) failing, and under inproc that failure is invisible in pixels.
+    mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_PMAP_ARM_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MGITEST_PMAP_LANE=1" "MGITEST_PERSISTENT_MAP_ARM=emulated"
+        "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/persistent-map-arm-split-DirectGLES.log"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split.PersistentMapArm."
+        TEST_FILTER "PersistentCoherentMapScenario.TheMapLandsInTheArmItsLaneDeclares"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            RESOURCE_LOCK persistent-map-arm-split-DirectGLES.log
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_PMAP_ARM_ENVIRONMENT}"
+    )
+
+    # --- EXIT GATE E3(e): the same checks with a ring small enough to force back-pressure -----
+    #
+    # BRIEF 7 E3(e) - "以上五条再跑一遍 ring 小到足以至少发生一次背压等待的配置" - was missing from
+    # the first cut of this package and missing from its report (review finding M-7). It is a
+    # LANE, not a new scenario: the same three split scenarios with SEG_CMD and SEG_STAGE at their
+    # floor, so a workload that fits comfortably in the 8 MiB / 32 MiB defaults has to wrap and
+    # wait at least once.
+    #
+    # 1 MiB is ConfigLoader's minimum for both (Config.h / ConfigLoader.cpp:363-364, floors of 1
+    # rather than 0 because a ring caps ONE record at half its size). That caps a record at 512
+    # KiB, which every record on the reduced path is far under, so the ring is legal and small
+    # rather than unusable.
+    #
+    # WHAT THIS LANE DOES NOT YET ASSERT, stated rather than implied: that a back-pressure wait
+    # ACTUALLY happened. That needs a counter only package s1 can publish (a producer-parked or
+    # ring-full tally on RingControl); until it exists this lane proves the five checks survive a
+    # small ring, not that the small ring bit. The gap is named in t1-v1.md's debts rather than
+    # left for someone to discover from a green.
+    mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_SMALL_RING_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MGITEST_SMALL_RING_LANE=1" "MOBILEGL_IPC_RING_MB=1" "MOBILEGL_IPC_STAGE_MB=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+    set(MGL_SPLIT_SMALL_RING_SCENARIOS ClearThenReadPixelsScenario TriangleScenario
+                                      PersistentCoherentMapScenario)
+    foreach(mglItestSmallRingScenario IN LISTS MGL_SPLIT_SMALL_RING_SCENARIOS)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.Split.SmallRing."
+            TEST_LIST "MGL_SPLIT_SMALL_${mglItestSmallRingScenario}_TESTS"
+            TEST_FILTER "${mglItestSmallRingScenario}.*"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-split"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_SMALL_RING_ENVIRONMENT}"
+        )
+    endforeach()
+    # Apply per-entry paths after GoogleTest discovery has populated the TEST_LISTs.
+    configure_file(Harness/SplitLogPaths.cmake.in SplitLogPaths.cmake @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/SplitLogPaths.cmake")
+    # Python is mandatory for this split integration gate (also used by the CI controls).
+    # Do not silently omit the ownership check when the interpreter is unavailable.
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME SplitLogPaths.PrivateAndDistinct
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Harness/split_log_paths.py"
+            check "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}")
+    set_tests_properties(SplitLogPaths.PrivateAndDistinct PROPERTIES LABELS "integration-split")
+endif()
+
+# f1: split-only source keeps the monolith registry unchanged.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_sources(MobileGLIntegrationTest PRIVATE Scenarios/F1WireScenario.cpp)
+    foreach(f1Slot ClearBufferfi ClearBufferfv ClearBufferiv ClearBufferuiv ClearNamedFramebufferfi ClearNamedFramebufferfv ClearNamedFramebufferiv ClearNamedFramebufferuiv CopyTexImage2D CopyTexSubImage2D GenerateMipmap GenerateMipmapPackedFloat GenerateMipmapDepth)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.Split.F1."
+            TEST_FILTER "F1WireScenario.${f1Slot}Pixels"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-split"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5b-f1-${f1Slot}.log"
+        )
+    endforeach()
+endif()
+
+# P5c ct (MG_Remote/CONTRACT-P5C.md §5): the two control records, split-only source for the
+# same reason as f1's - the scenario reads the SERVER sink's tallies, which a monolith build
+# has no symbol for. One block per case with a LOG PATH OF ITS OWN, the F1 pattern:
+# SplitLogPaths.PrivateAndDistinct fails a lane whose cases share one file, and the death
+# case's child truncates whatever path it inherits.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_sources(MobileGLIntegrationTest PRIVATE Scenarios/CtWireScenario.cpp)
+    foreach(ctCase ApplierResetCrossesAtThePrimedEdgeInSerialOrder
+                   TextureDeathCrossesAndTheRecycledSlotAnswersTheNewObject
+                   FramebufferDeathCrossesAndTheRecycledSlotAnswersTheNewObject
+                   TheDirectApplierResetCallOnTheGLThreadIsRoleViolation)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.Split.Ct."
+            TEST_FILTER "CtWireScenario.${ctCase}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-split"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5c-ct-${ctCase}.log"
+        )
+    endforeach()
+endif()
+
+# P5b measured named-blit blockers, exercising both backend bound-form lowerings.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    foreach(namedBlitBackend DirectGLES DirectVulkan)
+        mgl_itest_join_environment(MGL_ITEST_NAMED_BLIT_ENVIRONMENT
+            "MOBILEGL_BACKEND_TYPE=${namedBlitBackend}" "MOBILEGL_TRANSPORT=inproc"
+            "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
+            ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+        foreach(namedBlitCase NamedBlitPreservesBindingsAndRestoresNextVerbsPixels NamedBlitDefaultEndpointPixels)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "${namedBlitBackend}.Split.NamedBlit."
+                TEST_FILTER "F1WireScenario.${namedBlitCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES
+                    LABELS "integration-split"
+                    TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ENVIRONMENT "${MGL_ITEST_NAMED_BLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5b-${namedBlitBackend}-${namedBlitCase}.log")
+        endforeach()
+    endforeach()
+endif()

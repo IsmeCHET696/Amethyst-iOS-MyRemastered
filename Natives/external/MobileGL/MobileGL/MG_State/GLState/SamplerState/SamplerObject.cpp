@@ -9,8 +9,10 @@
 #include "SamplerObject.h"
 
 #include <MG_State/GLState/Core.h>
+#include <MG_State/GLState/StateObjectDeathNotice.h>
 
 #include <atomic>
+#include <MG_Pipe/PipeMutation.h>
 
 namespace MobileGL {
     namespace MG_State {
@@ -24,6 +26,35 @@ namespace MobileGL {
             SamplerObject::SamplerObject(Uint externalIndex)
                 : m_externalIndex(externalIndex), m_lifetimeId(AllocateLifetimeId()) {}
 
+#if MOBILEGL_PIPE_PUSH
+            SamplerObject::~SamplerObject() {
+                // P2 step e2: ANNOUNCE the death instead of leaving the backend to discover it in a
+                // garbage sweep. This is the last SharedPtr to this object dropping - not the
+                // glDelete* that only marks the name and leaves a still-bound object very much
+                // alive - so it is the exact moment the backend's twin, and the driver storage
+                // that twin owns, stop being reachable. The notice carries the lifetime id
+                // because the object no longer exists to be passed, and because the lifetime id
+                // is what the client slot allocator resolves the handle from. No-op unless a
+                // backend registered the ops (a pull build declares none at all).
+                //
+                // P4a D-I1: the notice is no longer raised directly - it is step 2 of the ONE
+                // client-side death helper for this kind, which emits delete_sampler_state
+                // first, raises the notice second and frees the slot last. Making the client
+                // the only death path is what stops a slot leaking under a backend that
+                // installs no death-ops table at all, and the backend's own notice becomes a
+                // redundant, idempotent second path rather than the only one.
+                //
+                // FOR A CONTENT-ADDRESSED SAMPLER CSO THIS HELPER CORRECTLY FREES NOTHING, and
+                // that is the design rather than a gap: the CSO belongs to a VALUE, not to this
+                // object (two identical SamplerObjects share one), so it is allocated with no
+                // lifetime id, the helper resolves nothing for this one, and the only death
+                // path for that slot is the CSO cache's LRU eviction - which is client-side and
+                // therefore backend-neutral on day one. What still goes out, unconditionally
+                // and exactly as before, is the notice.
+                MG_Pipe::MGPipeEmitSamplerCsoDestroyAndFree(m_lifetimeId);
+            }
+#endif
+
             void SamplerObject::BumpVersion() {
                 ++m_version;
                 // Every setter early-outs on an unchanged value, so this only runs on a real
@@ -32,6 +63,9 @@ namespace MobileGL {
                 // bindings must never miss an invalidation, and over-invalidating on a wrap-mode
                 // write costs one re-resolve.
                 if (pGLContext) pGLContext->BumpSamplingResolutionGeneration();
+                // Every sampler parameter is a texture PARAMETER as far as the dirty walk is
+                // concerned, and BumpVersion is the one choke point every setter reaches.
+                MGP_NOTE_AGGREGATE(TextureParams);
             }
 
             void SamplerObject::SetWrapS(SamplerWrapMode mode) {

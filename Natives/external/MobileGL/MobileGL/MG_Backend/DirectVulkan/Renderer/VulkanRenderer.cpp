@@ -14,6 +14,11 @@
 #include "VertexInputStateBuilder.h"
 
 #include "MG_State/GLState/Core.h"
+#include <MG_Pipe/PipeInputsSwitch.h>
+#if MOBILEGL_PIPE_PUSH
+// P5c ev: the GPU-write announcement routes through the reverse channel (R2).
+#include <MG_Impl/Pipe/ResourceTracker.h>
+#endif
 #include "MG_State/GLState/ProgramState/ProgramObject.h"
 #include "MG_State/GLState/ProgramState/ShaderObject.h"
 #include "MG_State/GLState/SamplerState/SamplerObject.h"
@@ -27,10 +32,18 @@
 #include "MG_Util/Converters/MGToVk/RenderStateEnumConverter.h"
 #include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
 #include "MG_Util/Math/HalfFloat.h"
+#include "MG_Util/Metrics/PipeStats.h"
 #include "MG_Util/Metrics/TextureMetrics.h"
 #include "MG_Util/SelfTest/PrimitivesGeneratedNoXfbProbe.h"
 #include "MG_Util/Texture/PixelStoreProcessor.h"
 #include <Config.h>
+#if MOBILEGL_BUILD_DISAGGREGATED
+// P5c (T5 / tx): the server's staged-texture shadow GenerateMipmap defines its chain on.
+#include <MG_Remote/Server/StagedTextureStore.h>
+#include <MG_Remote/Server/ServerLoop.h>
+// P5c (G6): the named-blit arm's endpoint resolution runs inside the frontend-keyed scope.
+#include <MG_Impl/Pipe/SlotAllocator.h>
+#endif
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -395,6 +408,101 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     };
     static DynamicStateShadow g_dynamicStateShadow;
 
+#if MOBILEGL_PIPE_PUSH
+    // ---- D12.3: DynamicTailKey's inputs against the P2 chunk table ----
+    //
+    // DynamicTailKey's inventory (declared above, one line per reader) is an exact,
+    // hand-maintained enumeration of what the six Apply* in the tail read. The P2 chunk table
+    // (MG_Pipe/MGPipeRenderStateSpans.h) is an independent, offsetof-derived statement of
+    // which bytes of RenderStateParameters are dynamic state. The two were written for
+    // different reasons, so making them check each other is free evidence: if a later chunk
+    // edit demotes or promotes one of these members, the mismatch is a BUILD BREAK here rather
+    // than a tail that silently stops being re-run when its input moves.
+    //
+    // The brief (P2 D12.3) expects every input to be dynamic; the tree says otherwise for
+    // exactly one, and the tree is right - see the ScissorTestEnabledMask note below.
+    //
+    // These assertions ARE D19's DynamicChunksCoverMagmasDynamicTailKey, in the only file this
+    // package owns. D19 names it as a case in MG_Test/Pipe/RenderStateSpansTest.cpp, which
+    // belongs to package A (C.5). INTEGRATOR: make sure the outcome is not "neither" - if
+    // package A did not land that case, this static_assert block is the whole gate, and if it
+    // did, the two are redundant on purpose and both should stay.
+    namespace {
+        // Is [begin, begin + size) covered entirely by DYNAMIC chunks?
+        constexpr Bool MagmaRenderStateRangeIsDynamic(SizeT begin, SizeT size) {
+            const SizeT end = begin + size;
+            for (SizeT i = 0; i < MG_Pipe::kMGPipeRenderStateChunkCount; ++i) {
+                const SizeT chunkBegin = MG_Pipe::kMGPipeRenderStateChunkBoundaries[i];
+                const SizeT chunkEnd = MG_Pipe::kMGPipeRenderStateChunkBoundaries[i + 1];
+                if (end <= chunkBegin || begin >= chunkEnd) continue; // disjoint
+                if (MG_Pipe::MGPipeRenderStateChunkIsPipeline(i)) return false;
+            }
+            return true;
+        }
+        using MagmaTailRsp = RenderStateParameters;
+
+#define MAGMA_TAIL_INPUT_IS_DYNAMIC(Member)                                                                            \
+    static_assert(MagmaRenderStateRangeIsDynamic(offsetof(MagmaTailRsp, Member),                                       \
+                                                 sizeof(MagmaTailRsp::Member)),                                        \
+                  "ApplyDynamicDrawStateTail reads " #Member                                                           \
+                  ", which the P2 chunk table no longer calls dynamic state: a change to it would "                    \
+                  "move the pipeline version, not the parameters version, and the tail would stop "                    \
+                  "being re-run for it")
+
+        // Viewports, DepthRanges and ScissorBoxes are asserted over the WHOLE array while the
+        // tail reads only element 0. That is deliberately stricter than the reader needs: the
+        // chunk table has no per-element granularity today, so an array that is dynamic at all
+        // is dynamic entirely, and asserting the whole of it says so. If a later phase ever
+        // splits a per-viewport chunk out, this is a build break by design - narrow the assert
+        // to element 0 then, and say why in the same commit.
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(Viewports);        // ApplyGLViewportState: Viewports[0]
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(DepthRanges);      // ApplyGLViewportState: DepthRanges[0]
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(BlendColor);       // ApplyBlendConstants
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(PolygonOffsetFactor); // ApplyPolygonOffsetState
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(PolygonOffsetUnits);  // ApplyPolygonOffsetState
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(LineWidth);        // ApplyLineWidthState
+        MAGMA_TAIL_INPUT_IS_DYNAMIC(ScissorBoxes);     // the scissor rect: ScissorBoxes[0]
+#undef MAGMA_TAIL_INPUT_IS_DYNAMIC
+
+        // ApplyStencilState reads three of the seven members of each face, and D6 splits
+        // StencilFaceState at sub-member granularity for exactly this reason: Ref, ValueMask
+        // and WriteMask are VK_DYNAMIC_STATE_STENCIL_{REFERENCE,COMPARE_MASK,WRITE_MASK}, while
+        // Func and the three ops are baked into the pipeline. Asserted per member, per face,
+        // because the split runs THROUGH the struct rather than around it.
+        constexpr SizeT kMagmaStencilFace1 = offsetof(MagmaTailRsp, StencilStates) + sizeof(StencilFaceState);
+#define MAGMA_TAIL_STENCIL_IS_DYNAMIC(Member)                                                                          \
+    static_assert(MagmaRenderStateRangeIsDynamic(offsetof(MagmaTailRsp, StencilStates) +                               \
+                                                     offsetof(StencilFaceState, Member),                               \
+                                                 sizeof(StencilFaceState::Member)),                                    \
+                  "ApplyStencilState reads the FRONT face's " #Member " as dynamic state");                            \
+    static_assert(MagmaRenderStateRangeIsDynamic(kMagmaStencilFace1 + offsetof(StencilFaceState, Member),               \
+                                                 sizeof(StencilFaceState::Member)),                                    \
+                  "ApplyStencilState reads the BACK face's " #Member " as dynamic state")
+
+        MAGMA_TAIL_STENCIL_IS_DYNAMIC(Ref);
+        MAGMA_TAIL_STENCIL_IS_DYNAMIC(ValueMask);
+        MAGMA_TAIL_STENCIL_IS_DYNAMIC(WriteMask);
+#undef MAGMA_TAIL_STENCIL_IS_DYNAMIC
+
+        // THE ONE INPUT THAT IS NOT DYNAMIC, and the brief's D12.3 says it should be.
+        // The tree wins, and it is right: the split's only rule is "a byte is pipeline state
+        // iff a public setter that calls BumpVersions() writes it", and ScissorTestEnabledMask
+        // is written by SetCapability(ScissorTest), which does. It sits in pipeline chunk P6
+        // with the other capability bools. The tail reads it only to decide between the
+        // scissor box and a full-extent rect, and it is HARMLESS there for a reason worth
+        // stating: a pipeline-half write moves the pipeline version, and the pipeline version
+        // moves only together with the parameters version (BumpVersions bumps both), so the
+        // tail's version gate is invalidated by it just the same. A DYNAMIC member promoted
+        // into the pipeline half would break that direction, which is what the asserts above
+        // are for; this one is pinned in the opposite direction so that DEMOTING it - which
+        // would be a real G7 violation - is also a build break.
+        static_assert(!MagmaRenderStateRangeIsDynamic(offsetof(MagmaTailRsp, ScissorTestEnabledMask),
+                                                      sizeof(MagmaTailRsp::ScissorTestEnabledMask)),
+                      "ScissorTestEnabledMask is written by SetCapability(ScissorTest), which calls "
+                      "BumpVersions(), so the chunk table must keep it in the pipeline half");
+    } // namespace
+#endif // MOBILEGL_PIPE_PUSH
+
     static void ResetDynamicStateShadow() {
         g_dynamicStateShadow = {};
     }
@@ -459,12 +567,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // round trip), which is why the honest-but-lossy path was kept over widening every
         // default-framebuffer Y-flip/pre-transform helper to floats. See the KNOWN INFIDELITY
         // note in MG_IntegrationTest/Scenarios/AdvertisedLimitsScenario.cpp.
-        const FloatVec4& stored = MG_State::pGLContext->GetViewportIndexed(index);
+        const FloatVec4& stored = MGB_CTX->GetViewportIndexed(index);
         const IntVec4 viewportState(static_cast<Int>(std::lround(stored.x())),
                                     static_cast<Int>(std::lround(stored.y())),
                                     static_cast<Int>(std::lround(stored.z())),
                                     static_cast<Int>(std::lround(stored.w())));
-        const FloatVec2& depthRange = MG_State::pGLContext->GetDepthRangeIndexed(index);
+        const FloatVec2& depthRange = MGB_CTX->GetDepthRangeIndexed(index);
         const IntVec2 logicalExtent = isDefaultFramebuffer
             ? ResolveDefaultFramebufferLogicalExtent(preTransform, framebufferExtent)
             : framebufferExtent;
@@ -519,7 +627,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     static void ApplyBlendConstants(VkCommandBuffer commandBuffer) {
-        const FloatVec4& blendColor = MG_State::pGLContext->GetBlendColor();
+        const FloatVec4& blendColor = MGB_CTX->GetBlendColor();
         const float blendConstants[4] = {
             blendColor.x(),
             blendColor.y(),
@@ -552,8 +660,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     static void ApplyPolygonOffsetState(VkCommandBuffer commandBuffer) {
-        const Float constantFactor = MG_State::pGLContext->GetPolygonOffsetUnits();
-        const Float slopeFactor = MG_State::pGLContext->GetPolygonOffsetFactor();
+        const Float constantFactor = MGB_CTX->GetPolygonOffsetUnits();
+        const Float slopeFactor = MGB_CTX->GetPolygonOffsetFactor();
         auto& shadow = g_dynamicStateShadow;
         if (shadow.depthBiasValid && shadow.depthBiasConstantFactor == constantFactor &&
             shadow.depthBiasSlopeFactor == slopeFactor) {
@@ -566,7 +674,24 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     static void ApplyLineWidthState(VkCommandBuffer commandBuffer) {
-        Float lineWidth = MG_State::pGLContext->GetLineWidth();
+        Float lineWidth = MGB_CTX->GetLineWidth();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5c (hd, CONTRACT-P5C §3.7): with an active transport the dynamic parameters are the
+        // SERVER's own backend's - the client caps mirror is client memory (rule E). Monolith
+        // reads the mirror as it always did.
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            if (MG_Backend::BackendObject* server = MG_Remote::Server::ServerLoopInstance().Backend()) {
+                const auto& dynamicParameters = server->GetDynamicParameters();
+                const Float minLineWidth = dynamicParameters.AliasedLineWidthRangeMin;
+                const Float maxLineWidth = dynamicParameters.AliasedLineWidthRangeMax;
+                if (lineWidth < minLineWidth) {
+                    lineWidth = minLineWidth;
+                } else if (lineWidth > maxLineWidth) {
+                    lineWidth = maxLineWidth;
+                }
+            }
+        } else
+#endif
         if (MG_Backend::pActiveBackendObject != nullptr) {
             const auto& dynamicParameters = MG_Backend::pActiveBackendObject->GetDynamicParameters();
             const Float minLineWidth = dynamicParameters.AliasedLineWidthRangeMin;
@@ -645,8 +770,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     static void ApplyStencilState(VkCommandBuffer commandBuffer) {
-        const StencilFaceState& frontStencil = MG_State::pGLContext->GetStencilState(StencilFace::Front);
-        const StencilFaceState& backStencil = MG_State::pGLContext->GetStencilState(StencilFace::Back);
+        const StencilFaceState& frontStencil = MGB_CTX->GetStencilState(StencilFace::Front);
+        const StencilFaceState& backStencil = MGB_CTX->GetStencilState(StencilFace::Back);
         const Uint32 frontReference = static_cast<Uint32>(std::max(frontStencil.Ref, 0));
         const Uint32 backReference = static_cast<Uint32>(std::max(backStencil.Ref, 0));
 
@@ -1239,11 +1364,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     static void RecordClearBufferError(const char* func, ErrorCode code, const char* message) {
-        MG_State::pGLContext->RecordError(code, MakeUnique<GenericErrorInfo>("DirectVulkan", func, message));
+        MGB_CTX->RecordError(code, MakeUnique<GenericErrorInfo>("DirectVulkan", func, message));
     }
 
     static void RecordTextureCopyError(const char* func, ErrorCode code, const char* message) {
-        MG_State::pGLContext->RecordError(code, MakeUnique<GenericErrorInfo>("DirectVulkan", func, message));
+        MGB_CTX->RecordError(code, MakeUnique<GenericErrorInfo>("DirectVulkan", func, message));
     }
 
     static Bool HasDistinctCompleteDepthStencilTextureAttachments(
@@ -1299,7 +1424,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     static void RecordUnsupportedFramebufferError(const char* func) {
-        MG_State::pGLContext->RecordError(
+        MGB_CTX->RecordError(
             ErrorCode::InvalidFramebufferOperation,
             MakeUnique<GenericErrorInfo>(
                 "DirectVulkan", func,
@@ -1510,6 +1635,52 @@ void main() {
             }
             return true;
         }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5c (T5 / tx): the split arm of EnsureGenerateMipmapStorageAllocated. Under an active
+        // transport the apply thread may not WRITE the client's level storage - AllocateStorage
+        // and MarkStorageDirty on a frontend TextureObjectMipmap are §6 layer-1 surfaces
+        // (CONTRACT-P5C §2.3) - so the generated chain is defined on the SERVER's staged-texture
+        // shadow instead, keyed by this renderer's own texture twin (the TextureResource,
+        // node-stable in VkTextureManager's map). Same levels, same extents - derived from the
+        // Vulkan-space base extent, whose depth is already 1 for every array target (layers
+        // live in arrayLayers there, so the fixed-component split the GL-space derivation
+        // needs is unnecessary here; these shadow extents answer in Vulkan space, which every
+        // consumer of a Magma-keyed entry shares) - and every generated level is marked
+        // dirty-in-shadow, because its texels are generated on the GPU and no byte answer
+        // exists on this side. The client's chain is left stale, which §2.3 rules CORRECT: the
+        // two readers that could observe the staleness are both named refusals under split.
+        // The upload-target list still comes from the frontend object - a shape READ, the P7
+        // registry's residual, not one of the writes this arm exists to remove.
+        static Bool EnsureGenerateMipmapShadowAllocated(const VkTextureManager::TextureResource& resource,
+                                                        Uint32 baseMipLevel,
+                                                        const Vector<TextureUploadTarget>& uploadTargets) {
+            if (resource.mipLevels <= baseMipLevel || uploadTargets.empty()) {
+                return false;
+            }
+            const IntVec3 storageBaseTexelSize = {static_cast<Int>(resource.extent.width),
+                                                  static_cast<Int>(resource.extent.height),
+                                                  static_cast<Int>(resource.depth)};
+            const IntVec3 baseTexelSize = ComputeMipTexelSize(storageBaseTexelSize, baseMipLevel);
+            if (baseTexelSize.x() <= 0 || baseTexelSize.y() <= 0 || baseTexelSize.z() <= 0) {
+                return false;
+            }
+            const Uint32 requiredMipLevelCount = baseMipLevel + ComputeFullMipLevelCount(baseTexelSize);
+            auto& store = MG_Remote::Server::ServerStagedTexture();
+            const Uint64 key = MG_Remote::Server::StagedTextureStore::KeyForTwinAddress(&resource);
+            for (const auto uploadTarget : uploadTargets) {
+                for (Uint32 level = baseMipLevel + 1; level < requiredMipLevelCount; ++level) {
+                    // A level the shadow already tracks (an adopted base chain) keeps its bytes;
+                    // the generation made the GPU newer than either, which the mark says.
+                    store.NoteLevelDefined(key, static_cast<Uint16>(uploadTarget), static_cast<Uint16>(level),
+                                           ComputeMipTexelSize(storageBaseTexelSize, level));
+                    store.MarkLevelGpuDirty(key, static_cast<Uint16>(uploadTarget), static_cast<Uint16>(level),
+                                            true);
+                }
+            }
+            return true;
+        }
+#endif
 
         static VkImageLayout ResolveGenerateMipmapFinalLayout(VkImageAspectFlags aspectMask) {
             return (aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0
@@ -2767,7 +2938,7 @@ void main() {
             // glReadPixels final conversion: GL_CLAMP_READ_COLOR defaults to GL_FIXED_ONLY,
             // clamping fixed-point (normalized) buffers to [0,1] - visible for SNORM reads.
             if (applyReadColorClamp && wideType == GL_FLOAT) {
-                const GLenum clampMode = MG_State::pGLContext->GetClampReadColor();
+                const GLenum clampMode = MGB_CTX->GetClampReadColor();
                 const Bool clamp = clampMode == GL_TRUE ||
                     (clampMode == GL_FIXED_ONLY && !IsFloatingPointReadbackFormat(srcFormat));
                 if (clamp) {
@@ -2984,7 +3155,7 @@ void main() {
     inline ProgramFactory::CompileOptionFlags GetShaderTransformFlags(VkSurfaceTransformFlagBitsKHR preTransform) {
         ProgramFactory::CompileOptionFlags flags = ProgramFactory::CompileOptionBit::PositionZRemap;
         const auto& currentDrawFBO =
-            MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+            MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
         if (currentDrawFBO != nullptr && currentDrawFBO->IsDefaultFramebuffer()) {
             flags |= ProgramFactory::CompileOptionBit::PositionYFlip;
             // gl_FragCoord follows the same rule the default-framebuffer RECTANGLES follow
@@ -3013,6 +3184,13 @@ void main() {
     }
 
     void VulkanRenderer::Initialize() {
+#if MOBILEGL_PIPE_PUSH
+        // P2 D14, and it belongs HERE rather than on a draw: "a Track-H subsystem whose bit is
+        // clear is a STARTUP Fatal{PipeLegacyMemosDisabled}". Checks Magma's own bit only, and
+        // only once this backend is the one being brought up, so an Espryt-side bitmask cannot
+        // kill a Magma run and vice versa.
+        MagmaPipeValidateSubsystemConfiguration();
+#endif
         CreateInstance();
         CreateSurface();
         PickPhysicalDevice();
@@ -3192,7 +3370,12 @@ void main() {
             m_physicalDevice.properties.limits.minUniformBufferOffsetAlignment, m_config.MaxFramesInFlight,
             maxProgramBindings, kDescriptorSetsPerFrame, m_textureManager.get(), m_samplerManager.get());
         MOBILEGL_ASSERT(succeeded, "UniformDescriptorBinder initialization failed.");
+#if MOBILEGL_PIPE_PUSH
+        m_vertexInputStateFactory =
+            MakeUnique<VertexInputStateFactory>(m_config, m_physicalDevice.handle, m_pipeIdentity);
+#else
         m_vertexInputStateFactory = MakeUnique<VertexInputStateFactory>(m_config, m_physicalDevice.handle);
+#endif
         MOBILEGL_ASSERT(m_vertexInputStateFactory != nullptr, "VertexInputStateFactory creation failed.");
 
         // Prime the first frame so Render() always targets an acquired swapchain image.
@@ -3266,8 +3449,9 @@ void main() {
         }
         m_vertexInputStateFactory.reset();
         m_xfbCounterBuffer.Destroy();
-        m_xfbCounterSlotByObject.clear();
-        m_xfbNextCounterSlot = 0;
+        m_xfbCounterSlotOwner.fill(0);
+        m_xfbCounterSlotLastUse.fill(0);
+        m_xfbCounterSlotUseSerial = 0;
         m_xfbCountersValid.fill(false);
         m_xfbLastSeenGeneration.fill(0);
         if (m_occlusionQueryPool != VK_NULL_HANDLE) {
@@ -3443,8 +3627,8 @@ void main() {
         // with restart off it is a legitimate index and excluding it would truncate the
         // converted stream by exactly that vertex.
         const Bool primitiveRestartActive =
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::PrimitiveRestart) ||
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::PrimitiveRestartFixedIndex);
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::PrimitiveRestart) ||
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::PrimitiveRestartFixedIndex);
         const Uint32 restartSentinel = indexSize == 1 ? 0xFFu : indexSize == 2 ? 0xFFFFu : 0xFFFFFFFFu;
         Uint32 maxIndex = 0;
         Bool sawIndex = false;
@@ -3539,6 +3723,76 @@ void main() {
         if (m_vaoDrawMemoTable.empty()) {
             m_vaoDrawMemoTable.resize(kVaoDrawMemoSlotCount);
         }
+#if MOBILEGL_PIPE_PUSH
+        if (MagmaPipeAbaControlDefeatsIdentity()) {
+            // Negative control C (P2 brief D18), ahead of BOTH arms because it defeats the
+            // identity half of both keys at once: the legacy arm's (address, lifetime id) pair
+            // and the handle arm's {slot, gen}. Every VAO lands on one entry and the entry is
+            // handed back without an identity compare and WITHOUT being cleared - which is
+            // exactly what this table would do if a replacement object reproduced its dead
+            // predecessor's address, or reused its slot without the generation moving.
+            //
+            // Nothing else about the entry is relaxed: whether the resolved bindings it holds
+            // are then USED is still decided by TryBindResolvedVertexBindings' frame serial,
+            // content hash, active-attribute mask and slice epochs. That is what keeps the arm
+            // an assertion about identity rather than about the memo as a whole.
+            VaoDrawMemo& aliased = m_vaoDrawMemoTable[kMagmaPipeAbaControlSlotIndex];
+            aliased.vaoKey = vao;
+            aliased.vaoLifetimeId = vao->GetLifetimeId();
+            return &aliased;
+        }
+        // ---- P2 D12.4, the handle arm ----
+        //
+        // The slot PICKS the entry, and the handle DECIDES whether the entry is this VAO's -
+        // the same division of labour the legacy arm below gives the address and the lifetime
+        // id, with two differences that are both improvements:
+        //
+        //   * the slot is dense from 1, so below kVaoDrawMemoSlotCount live slots the map is a
+        //     bijection and the two-way probe never collides at all, where an address hash
+        //     collides by the birthday rule from the first few dozen VAOs;
+        //   * the handle is an exact identity - Gen moves whenever a slot changes owner - so
+        //     neither a deleted VAO's successor at the same heap address nor a VAO whose slot
+        //     was recycled can match a predecessor's entry, even byte-identically configured.
+        //     That is what makes the lifetime-id half of the legacy compare unnecessary here.
+        //
+        // The capacity and the victim rule are deliberately the base ref's, unchanged: this is
+        // the one memo of the three that HAD a capacity before P2, and an entry lost to a
+        // collision costs exactly what it cost then (one vertex-binding re-resolve). Above
+        // kVaoDrawMemoSlotCount live VAOs a set of two ways serves four slots, and degrades
+        // from there - never worse than the address-hashed table it replaces, which was already
+        // colliding.
+        if (MagmaPipeTrackHArmIsHandles(MG_Pipe::kMGPipeSubsystemMagmaVertexInput)) {
+            const MG_Pipe::MGPipeHandle handle = ResolveVaoHandle(*vao);
+            const Uint32 index = MagmaPipeSlotIndex(handle) & (kVaoDrawMemoSlotCount - 1u);
+            VaoDrawMemo& first = m_vaoDrawMemoTable[index];
+            if (first.vaoHandle == handle) {
+                return &first;
+            }
+            VaoDrawMemo& second = m_vaoDrawMemoTable[index ^ 1u];
+            if (second.vaoHandle == handle) {
+                return &second;
+            }
+            // Miss: recycle a slot. Prefer an unclaimed one; otherwise evict the entry whose
+            // bindings memo is older (its VAO is the one drawn less recently).
+            VaoDrawMemo* victim = &first;
+            if (!MG_Pipe::MGPipeHandleIsNull(first.vaoHandle) &&
+                (MG_Pipe::MGPipeHandleIsNull(second.vaoHandle) ||
+                 second.bindings.frameSerial < first.bindings.frameSerial)) {
+                victim = &second;
+            }
+            victim->vaoHandle = handle;
+            victim->vaoKey = vao;
+            victim->vaoLifetimeId = vao->GetLifetimeId();
+            victim->contentHash = 0;
+            victim->layoutFactsValid = false;
+            // Unmatchable until a resolve completes (same rule as the legacy arm: a bailed-out
+            // resolve must never leave stale contents matchable).
+            victim->bindings.frameSerial = 0;
+            victim->bindings.indexFrameSerial = 0;
+            victim->bindings.indexBuffer = nullptr;
+            return victim;
+        }
+#endif
         // Multiplicative mix of the (16-byte-aligned) address; take high bits, they
         // carry the most entropy of a multiply.
         const Uint64 mixed = static_cast<Uint64>(reinterpret_cast<SizeT>(vao) >> 4) * 0x9E3779B97F4A7C15ull;
@@ -3548,6 +3802,13 @@ void main() {
         // its own is recycled, and a slot matched on a recycled address hands the new VAO
         // the dead one's resolved bindings.
         const Uint64 lifetimeId = vao->GetLifetimeId();
+        // Negative control C has NO consumer here. It is answered once, ahead of both arms, by
+        // the early return above, so a run that reaches this line has the knob off and the
+        // lifetime-id half of the compare is unconditional. A fourth consumer here would be a
+        // second site deciding the same question - what MagmaPipeAbaControlDefeatsIdentity
+        // exists to prevent - and a trap: narrow that early return later and this one would
+        // silently return to D18's retired semantics. If it is ever narrowed, ask the accessor
+        // here rather than re-reading MG_Config::Features.
         VaoDrawMemo& first = m_vaoDrawMemoTable[index];
         if (first.vaoKey == vao && first.vaoLifetimeId == lifetimeId) {
             return &first;
@@ -3616,7 +3877,7 @@ void main() {
         VaoDrawMemo* slot = nullptr;
         ResolvedVertexBindings* memo = nullptr;
         Uint64 vaoContentHash = 0;
-        const Bool vaoHashKnown = vao.GetBackendHashMemo(vaoContentHash);
+        const Bool vaoHashKnown = VaoContentHashIfKnown(vao, vaoContentHash);
         if (vaoHashKnown) {
             slot = LookupVaoDrawMemo(&vao);
             memo = &slot->bindings;
@@ -3921,7 +4182,7 @@ void main() {
             }
 
             const auto glType = programObj.vertexInputTypes[location];
-            const auto& currentValue = MG_State::pGLContext->GetCurrentVertexAttribute(location);
+            const auto& currentValue = MGB_CTX->GetCurrentVertexAttribute(location);
             VkFormat format = VK_FORMAT_UNDEFINED;
             const void* sourceData = nullptr;
             VkDeviceSize sourceSize = 0;
@@ -4055,7 +4316,7 @@ void main() {
         Bool substituteRestart = false;
         // One bulk parameters fetch instead of up to three accessor calls per indexed
         // draw; all three inputs are pure reads of these fields.
-        const RenderStateParameters& rsp = MG_State::pGLContext->GetRenderStateParameters();
+        const RenderStateParameters& rsp = MGB_CTX->GetRenderStateParameters();
         if (rsp.PrimitiveRestartEnabled && !rsp.PrimitiveRestartFixedIndexEnabled) {
             const Uint32 restartIndex = rsp.PrimitiveRestartIndex;
             const Uint32 fixedMax = MG_Util::FixedRestartIndexForGLType(pIndexBufferView->indexType);
@@ -4281,6 +4542,22 @@ void main() {
     }
 
     void VulkanRenderer::ShutdownBlitResources() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5c (G6, CONTRACT-P5C §3.1's named exemption): the hidden blit program and samplers
+        // are FRONTEND objects the server backend created on the apply thread, and under an
+        // active transport they die here on that same thread. Their destructors run the client
+        // death helper, whose lifetime-id probe is the frontend-keyed registry family - it
+        // resolves to nothing (no handle was ever minted for these objects) and routes no
+        // delete, so the scope admits the probe as named debt rather than letting the guard
+        // Fatal at server teardown. P7 gives these resources storage that is not a frontend
+        // object.
+        //
+        // P5e (id), ruling 12: one of Magma's FOUR apply-thread allocator debts, and the scope
+        // is now named after that debt rather than after the frontend-keyed registry - Espryt's
+        // half of which P5e is retiring, while this one waits for P7. The exemption is keyed on
+        // a DirectVulkan server, which is what this file always is.
+        const MG_Pipe::MagmaP7AllocatorDebtScope magmaP7AllocatorDebt;
+#endif
         m_blitResources = {};
     }
 
@@ -4355,6 +4632,13 @@ void main() {
     }
 
     void VulkanRenderer::ShutdownDepthMipmapResources() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Same shape as ShutdownBlitResources above: the hidden depth-mipmap program is a
+        // frontend object created and destroyed by the server backend on the apply thread, and
+        // its destructor's lifetime-id probe is admitted here as named debt - Magma's, P7's to
+        // retire, which is what the scope's P5e name says (ruling 12).
+        const MG_Pipe::MagmaP7AllocatorDebtScope magmaP7AllocatorDebt;
+#endif
         m_depthMipmapResources = {};
     }
 
@@ -4810,11 +5094,12 @@ void main() {
     Uint32 VulkanRenderer::ResolveEffectiveSampleMask(VkSampleCountFlagBits rasterizationSamples) const {
         constexpr Uint32 kFullCoverage = 0xffffffffu;
         if (rasterizationSamples == VK_SAMPLE_COUNT_1_BIT) return kFullCoverage;
-        if (!MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::Multisample)) return kFullCoverage;
-        if (!MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::SampleMask)) return kFullCoverage;
-        return MG_State::pGLContext->GetRenderStateParameters().SampleMaskValue;
+        if (!MGB_CTX->IsCapabilityEnabled(CapabilityInput::Multisample)) return kFullCoverage;
+        if (!MGB_CTX->IsCapabilityEnabled(CapabilityInput::SampleMask)) return kFullCoverage;
+        return MGB_CTX->GetRenderStateParameters().SampleMaskValue;
     }
 
+#if MOBILEGL_PIPE_LEGACY_MEMOS
     Uint64 VulkanRenderer::ComputePipelineStateHash(Uint32 colorAttachmentCount,
                                                     VkSampleCountFlagBits rasterizationSamples) const {
         // One bulk fetch instead of ~17 per-field accessor calls into MG_State: every
@@ -4823,7 +5108,7 @@ void main() {
         // field (RenderState.cpp), so the hashed values are bit-identical. This runs on
         // every draw whose pipeline-state version moved (a per-draw GL_BLEND toggle),
         // where the accessor-call overhead dominated the hash itself.
-        const RenderStateParameters& p = MG_State::pGLContext->GetRenderStateParameters();
+        const RenderStateParameters& p = MGB_CTX->GetRenderStateParameters();
         Uint64 capabilityBits = 0;
         capabilityBits |= p.CullFaceEnabled ? 1ull << 0 : 0;
         capabilityBits |= p.DepthTestEnabled ? 1ull << 1 : 0;
@@ -4905,6 +5190,23 @@ void main() {
         }
         return hash;
     }
+#endif // MOBILEGL_PIPE_LEGACY_MEMOS
+
+#if MOBILEGL_PIPE_PUSH && !MOBILEGL_PIPE_LEGACY_MEMOS
+    Uint64 VulkanRenderer::ComputePipelineSubsetStateHashFallback() const {
+        // The client's own hash, over the client's own definition of the pipeline subset - the
+        // seven pipeline chunks of the P2 chunk table, which is a strict SUPERSET of what
+        // ComputePipelineStateHash enumerated by hand. The render-pass facts it does not carry
+        // (colorAttachmentCount, the rasterization sample count, and through them the effective
+        // sample mask) are exactly the facts entry.renderPassHash separates, which is why the
+        // CSO handle can key this memo in the first place; this fallback inherits that argument
+        // unchanged.
+        //
+        // Only reached with no render-state CSO bound, and only in a build with no pre-handle
+        // arm to fall back to instead.
+        return MG_Pipe::MGPipeComputePipelineSubsetHash(MGB_CTX->GetRenderStateParameters());
+    }
+#endif
 
     // A program that runs a geometry shader AND captures transform feedback. Both halves are
     // link-time properties, so this is safe to fold into a pipeline keyed on the program hash.
@@ -4935,7 +5237,7 @@ void main() {
         if (!(aspects & DrawSetupAspect::IndexBuffer) || pIndexBufferView == nullptr) {
             return false;
         }
-        const RenderStateParameters& rsp = MG_State::pGLContext->GetRenderStateParameters();
+        const RenderStateParameters& rsp = MGB_CTX->GetRenderStateParameters();
         if (rsp.PrimitiveRestartFixedIndexEnabled) {
             return true;
         }
@@ -4979,7 +5281,26 @@ void main() {
         // the VALUE hash of that subset, never the version itself: the version is monotonic, so
         // per-draw state flips (GL_BLEND toggles) would otherwise miss entries the memo holds.
         // The version only guards recomputing the hash - unchanged version, unchanged bytes.
-        const Uint renderStateVersion = MG_State::pGLContext->GetPipelineStateVersion();
+        const Uint renderStateVersion = MGB_CTX->GetPipelineStateVersion();
+#if MOBILEGL_PIPE_PUSH
+        // P2 D12.1. Non-null means the client's render-state CSO handle is this draw's state
+        // key and the hash below is not computed at all; null means the pre-handle arm. The
+        // two arms' entries can never match each other: the handle arm stores hash 0 and a
+        // real handle, the legacy arm a real hash and the null handle, and the probe compares
+        // both components.
+        const MG_Pipe::MGPipeHandle renderStateCso = ResolveBoundRenderStateCso();
+        // Exactly one of the two state keys is live per draw, and the ternary short-circuits,
+        // so a draw on the handle arm neither hashes nor touches the fallback cache.
+        const Uint64 pipelineStateHash =
+            !MG_Pipe::MGPipeHandleIsNull(renderStateCso)
+                ? 0
+                : ResolveFallbackPipelineStateHash(renderStateVersion,
+                                                   renderPassEntry.colorAttachmentCount,
+                                                   renderPassEntry.sampleCount);
+#else
+        // THE PULL BUILD'S TEXT, statement for statement what the base ref has: G1 admits no
+        // resize of this function, and a helper the compiler merely inlines is not the same
+        // instruction schedule.
         if (!m_pipelineStateHashValid || m_pipelineStateHashVersion != renderStateVersion ||
             m_pipelineStateHashColorCount != renderPassEntry.colorAttachmentCount ||
             m_pipelineStateHashSampleCount != renderPassEntry.sampleCount) {
@@ -4991,16 +5312,30 @@ void main() {
             m_pipelineStateHashValid = true;
         }
         const Uint64 pipelineStateHash = m_pipelineStateHash;
+#endif
         for (Uint32 i = 0; i < m_pipelineMemoCount; ++i) {
             const PipelineMemoEntry& entry = m_pipelineMemo[i];
             if (entry.pipeline != VK_NULL_HANDLE && entry.mode == mode &&
                 entry.programHash == programObj.hash && entry.vertexInputHash == vertexLayoutHash &&
                 entry.renderPassHash == renderPassHash &&
                 entry.pipelineStateHash == pipelineStateHash &&
+#if MOBILEGL_PIPE_PUSH
+                entry.renderStateCso == renderStateCso &&
+#endif
                 entry.primitiveRestartEnable == primitiveRestartEnable &&
                 entry.transformFlags == transformFlags) {
+                if (MG_Util::PipeStats::Enabled()) {
+                    // Gate 5 of section 2.3.1. On a hit this whole function cost the one
+                    // GetPipelineStateVersion read above plus this value compare.
+                    MG_Util::PipeStats::CountGate(MG_Util::PipeStats::Gate::MagmaPipelineMemo, /*hit=*/true);
+                    MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 1);
+                }
                 return entry.pipeline;
             }
+        }
+        if (MG_Util::PipeStats::Enabled()) {
+            MG_Util::PipeStats::CountGate(MG_Util::PipeStats::Gate::MagmaPipelineMemo, /*hit=*/false);
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 1);
         }
 
         // Shape gate. Behind the memo probe deliberately: only a pipeline that was created
@@ -5157,22 +5492,22 @@ void main() {
             syntheticVertexInputState.pNext = vis.state.pNext;
             pipelineVertexInputState = &syntheticVertexInputState;
         }
-        auto cullFaceEnabled = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::CullFace);
-        auto depthTestEnabled = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::DepthTest);
+        auto cullFaceEnabled = MGB_CTX->IsCapabilityEnabled(CapabilityInput::CullFace);
+        auto depthTestEnabled = MGB_CTX->IsCapabilityEnabled(CapabilityInput::DepthTest);
         auto polygonOffsetFillEnabled =
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::PolygonOffsetFill) &&
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::PolygonOffsetFill) &&
             DrawModeUsesPolygonFill(mode);
         auto rasterizerDiscardEnabled =
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard);
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard);
         auto colorLogicOpEnabled =
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::ColorLogicOp) && m_logicOpFeatureEnabled;
-        auto stencilTestEnabled = MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::StencilTest);
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::ColorLogicOp) && m_logicOpFeatureEnabled;
+        auto stencilTestEnabled = MGB_CTX->IsCapabilityEnabled(CapabilityInput::StencilTest);
         // A framebuffer without a depth (stencil) attachment behaves as if the depth
         // (stencil) test always passes and nothing is written - even when the bound
         // image is a packed depth-stencil texture attached through only one half.
         {
             const auto& gatingFbo =
-                MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+                MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
             if (gatingFbo != nullptr && !gatingFbo->IsDefaultFramebuffer()) {
                 const auto& depthAtt = gatingFbo->GetAttachment(MobileGL::FramebufferAttachmentType::Depth);
                 const auto& stencilAtt = gatingFbo->GetAttachment(MobileGL::FramebufferAttachmentType::Stencil);
@@ -5184,10 +5519,10 @@ void main() {
                 }
             }
         }
-        const StencilFaceState& frontStencil = MG_State::pGLContext->GetStencilState(StencilFace::Front);
-        const StencilFaceState& backStencil = MG_State::pGLContext->GetStencilState(StencilFace::Back);
+        const StencilFaceState& frontStencil = MGB_CTX->GetStencilState(StencilFace::Front);
+        const StencilFaceState& backStencil = MGB_CTX->GetStencilState(StencilFace::Back);
         const VkPolygonMode requestedPolygonMode =
-            MG_Util::ConvertPolygonModeToVkEnum(MG_State::pGLContext->GetPolygonModeFront());
+            MG_Util::ConvertPolygonModeToVkEnum(MGB_CTX->GetPolygonModeFront());
         // VK_POLYGON_MODE_LINE/_POINT require the fillModeNonSolid device feature; fall back to
         // VK_POLYGON_MODE_FILL when the device lacks it.
         const VkPolygonMode effectivePolygonMode =
@@ -5242,6 +5577,24 @@ void main() {
             return VK_NULL_HANDLE;
         }
 
+        if (MG_Util::PipeStats::Enabled()) {
+            // THE payload-builder walk section 2.3.1 says only runs on a pipeline memo miss.
+            // Counted as a constant, and counted HERE rather than at the top of the walk:
+            // the list-topology primitive-restart refusal above returns VK_NULL_HANDLE after
+            // only ten of these reads have run, and a tally that fires before an early return
+            // is an OVER-count, which breaks the lower-bound contract every other tally keeps.
+            //
+            // The 15 are: the six capability reads (cull face, depth test, polygon offset
+            // fill, rasterizer discard, colour logic op, stencil test), the draw-FBO slot
+            // read that gates depth/stencil, the two stencil face states, the polygon mode,
+            // the min sample shading value, the patch vertex count, the depth mask, the depth
+            // func, and the second draw-FBO slot read below. The sample-shading CAPABILITY
+            // read is the one excluded: it sits behind && on m_sampleRateShadingFeatureEnabled
+            // and does not run on a device without the feature. The other conditional reads -
+            // the cull-mode ternary, the logic-op fetch, the two tessellation default-level
+            // reads - are excluded for the same reason, so this stays a LOWER bound.
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 15);
+        }
         PipelineFactory::PipelineCreatePayload payload {
             .programHash = programObj.hash,
             .vertexInputHash = vertexLayoutHash,
@@ -5254,18 +5607,18 @@ void main() {
             // driver's own rate. Both halves move the render state's PIPELINE version, so a cached
             // pipeline built at the old rate cannot be handed back for the new one.
             .sampleShadingEnable = m_sampleRateShadingFeatureEnabled &&
-                                   MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::SampleShading),
-            .minSampleShading = MG_State::pGLContext->GetMinSampleShadingValue(),
+                                   MGB_CTX->IsCapabilityEnabled(CapabilityInput::SampleShading),
+            .minSampleShading = MGB_CTX->GetMinSampleShadingValue(),
             // Word 1 keeps its all-ones initialiser: GL has no state for samples 32..63.
             .sampleMask = {ResolveEffectiveSampleMask(renderPassEntry.sampleCount), 0xffffffffu},
             .subpass = 0,
             .topology = vkTopology,
             .primitiveRestartEnable = primitiveRestartEnabled,
-            .patchControlPoints = static_cast<Uint32>(MG_State::pGLContext->GetPatchVertices()),
+            .patchControlPoints = static_cast<Uint32>(MGB_CTX->GetPatchVertices()),
             .viewportCount = ResolveDrawViewportCount(programObj.writesViewportIndexBuiltin),
             .polygonMode = effectivePolygonMode,
             .cullMode = cullFaceEnabled
-                ? MG_Util::ConvertCullFaceModeToVkEnum(MG_State::pGLContext->GetCullFaceMode(), invertClockwise)
+                ? MG_Util::ConvertCullFaceModeToVkEnum(MGB_CTX->GetCullFaceMode(), invertClockwise)
                 : VK_CULL_MODE_NONE,
             .frontFace = VK_FRONT_FACE_CLOCKWISE,
             // Read the geometry stage off the program's own shader list rather than
@@ -5279,13 +5632,13 @@ void main() {
             .provokingVertexMode = SelectProvokingVertexMode(
                 vkTopology, ProgramCapturesXfbFromGeometryStage(program)),
             .depthTestEnable = depthTestEnabled,
-            .depthWriteEnable = depthTestEnabled && MG_State::pGLContext->GetDepthMask(),
+            .depthWriteEnable = depthTestEnabled && MGB_CTX->GetDepthMask(),
             .depthBiasEnable = polygonOffsetFillEnabled,
             .rasterizerDiscardEnable = rasterizerDiscardEnabled,
             .logicOpEnable = colorLogicOpEnabled,
             .stencilTestEnable = stencilTestEnabled,
-            .depthCompareOp = MG_Util::ConvertDepthTestFuncToVkEnum(MG_State::pGLContext->GetDepthFunc()),
-            .logicOp = MG_Util::ConvertLogicOperationToVkEnum(MG_State::pGLContext->GetLogicOp()),
+            .depthCompareOp = MG_Util::ConvertDepthTestFuncToVkEnum(MGB_CTX->GetDepthFunc()),
+            .logicOp = MG_Util::ConvertLogicOperationToVkEnum(MGB_CTX->GetLogicOp()),
             .frontStencilFailOp = MG_Util::ConvertStencilOperationToVkEnum(frontStencil.FailOp),
             .frontStencilPassOp = MG_Util::ConvertStencilOperationToVkEnum(frontStencil.PassDepthPassOp),
             .frontStencilDepthFailOp = MG_Util::ConvertStencilOperationToVkEnum(frontStencil.PassDepthFailOp),
@@ -5321,8 +5674,8 @@ void main() {
         // handed back after the application changed them.
         if (programObj.needsPassthroughTessControl && programObj.passthroughTessControlEmulatable &&
             vkTopology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
-            const FloatVec4& defaultOuterLevel = MG_State::pGLContext->GetPatchDefaultOuterLevel();
-            const FloatVec2& defaultInnerLevel = MG_State::pGLContext->GetPatchDefaultInnerLevel();
+            const FloatVec4& defaultOuterLevel = MGB_CTX->GetPatchDefaultOuterLevel();
+            const FloatVec2& defaultInnerLevel = MGB_CTX->GetPatchDefaultInnerLevel();
             payload.passthroughTessControlKey = ProgramFactory::ComputePassthroughTessControlKey(
                 payload.patchControlPoints, defaultOuterLevel, defaultInnerLevel,
                 programObj.passthroughPerVertexMembers);
@@ -5374,7 +5727,7 @@ void main() {
                         "GetOrCreatePipeline: colorAttachmentCount=%u exceeds payload capacity",
                         payload.colorAttachmentCount);
         const auto& drawFboBinding =
-            MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+            MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
         MOBILEGL_ASSERT(drawFboBinding != nullptr, "GetOrCreatePipeline: draw framebuffer is null");
         const Bool isDefaultDrawFbo = drawFboBinding->IsDefaultFramebuffer();
         const auto& drawBuffers = drawFboBinding->GetDrawBuffers();
@@ -5402,14 +5755,14 @@ void main() {
             BlendFactor dstAlpha = BlendFactor::Zero;
             BlendEquation colorEquation = BlendEquation::Add;
             BlendEquation alphaEquation = BlendEquation::Add;
-            MG_State::pGLContext->GetBlendFuncIndexed(i, srcRGB, dstRGB, srcAlpha, dstAlpha);
-            MG_State::pGLContext->GetBlendEquationIndexed(i, colorEquation, alphaEquation);
-            const Bool blendEnabled = MG_State::pGLContext->IsCapabilityEnabledIndexed(CapabilityInput::Blend, i);
+            MGB_CTX->GetBlendFuncIndexed(i, srcRGB, dstRGB, srcAlpha, dstAlpha);
+            MGB_CTX->GetBlendEquationIndexed(i, colorEquation, alphaEquation);
+            const Bool blendEnabled = MGB_CTX->IsCapabilityEnabledIndexed(CapabilityInput::Blend, i);
             // Per-draw-buffer color write mask (glColorMaski). Divergent per-attachment masks require
             // the independentBlend device feature; when it is absent, fall back to draw buffer 0's
             // mask for every attachment (matching the non-indexed glColorMask broadcast).
             const BoolVec4 bufferMask =
-                MG_State::pGLContext->GetColorMaskIndexed(m_independentBlendFeatureEnabled ? i : 0);
+                MGB_CTX->GetColorMaskIndexed(m_independentBlendFeatureEnabled ? i : 0);
             VkColorComponentFlags attachmentColorWriteMask = static_cast<VkColorComponentFlags>(
                 (bufferMask.r() ? VK_COLOR_COMPONENT_R_BIT : 0u) |
                 (bufferMask.g() ? VK_COLOR_COMPONENT_G_BIT : 0u) |
@@ -5637,6 +5990,9 @@ void main() {
             entry.vertexInputHash = vertexLayoutHash;
             entry.renderPassHash = renderPassHash;
             entry.pipelineStateHash = pipelineStateHash;
+#if MOBILEGL_PIPE_PUSH
+            entry.renderStateCso = renderStateCso;
+#endif
             entry.primitiveRestartEnable = primitiveRestartEnable;
             entry.transformFlags = transformFlags;
             entry.pipeline = pipeline;
@@ -5825,7 +6181,7 @@ void main() {
     VkRect2D VulkanRenderer::ComputeGLScissorRect(Uint32 index, const IntVec2& extent,
                                                   VkSurfaceTransformFlagBitsKHR preTransform,
                                                   Bool isDefaultFbo) const {
-        const auto& parameters = MG_State::pGLContext->GetRenderStateParameters();
+        const auto& parameters = MGB_CTX->GetRenderStateParameters();
         if ((parameters.ScissorTestEnabledMask & (1u << index)) == 0) {
             VkRect2D full{};
             full.offset = {0, 0};
@@ -5886,11 +6242,36 @@ void main() {
         // One compare for the whole tail: see the gate's declaration in
         // DynamicStateShadow for why (version, extent, default-FBO flag) pins every
         // input the six Apply* below read.
-        const Uint paramsVersion = MG_State::pGLContext->GetRenderStateParametersVersion();
+        //
+        // P2 D12.3: this read is RE-SOURCED, not re-shaped. Under MOBILEGL_PIPE_PUSH the
+        // accessor no longer walks into GLContext's RenderState - it returns
+        // PipeInputs::m_renderStateParametersVersion, which the applier publishes from
+        // MGPDynamicState::Version (set_dynamic_state) and MGPBindRenderState::Version
+        // (bind_render_state). So the gate now reads what the client PUSHED.
+        //
+        // What it does NOT do, and the P2 brief expects it to, is stop moving on a
+        // pipeline-only change. The tree settles that against the brief: bind_render_state
+        // carries m_version too and the applier publishes it, and it has to - Espryt's
+        // SyncRenderState uses the very same counter as its all-state change detector and G5
+        // forbids touching it, so a bind that rewrote the pipeline half while leaving the
+        // counter still would make Espryt skip re-syncing the blend state it just changed.
+        // The second-level DynamicTailKey compare below is therefore what actually absorbs a
+        // pipeline-only change, exactly as it did before P2: one key build, no vkCmd*.
+        const Uint paramsVersion = MGB_CTX->GetRenderStateParametersVersion();
         if (shadow.dynamicTailValid && shadow.dynamicTailParamsVersion == paramsVersion &&
             shadow.dynamicTailExtentX == extent.x() && shadow.dynamicTailExtentY == extent.y() &&
             shadow.dynamicTailIsDefaultFbo == isDefaultFbo) {
+            // Gate 6 of section 2.3.1: one version read plus a four-integer compare.
+            if (MG_Util::PipeStats::Enabled()) {
+                MG_Util::PipeStats::CountGate(MG_Util::PipeStats::Gate::MagmaDynamicTail, /*hit=*/true);
+                MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 1);
+            }
             return;
+        }
+        if (MG_Util::PipeStats::Enabled()) {
+            // The version read above and the bulk parameter fetch that builds the value key.
+            MG_Util::PipeStats::CountGate(MG_Util::PipeStats::Gate::MagmaDynamicTail, /*hit=*/false);
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 2);
         }
         const VkSurfaceTransformFlagBitsKHR preTransform = m_swapchainObject.GetPreTransform();
         // Second-level VALUE gate: the version moved, but RenderState's version counts
@@ -5900,7 +6281,7 @@ void main() {
         // re-derive the value its shadow already holds.
         DynamicStateShadow::DynamicTailKey key;
         {
-            const RenderStateParameters& p = MG_State::pGLContext->GetRenderStateParameters();
+            const RenderStateParameters& p = MGB_CTX->GetRenderStateParameters();
             // Viewport 0 and its depth range: ApplyGLViewportState reads exactly those two
             // (per-index state for indices > 0 is keyed separately, see multiViewportKey below).
             key.viewport[0] = p.Viewports[0].x();
@@ -5976,7 +6357,7 @@ void main() {
         MOBILEGL_ASSERT(
             [&] {
                 const auto& fbo =
-                    MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+                    MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
                 return isDefaultFbo == (fbo != nullptr && fbo->IsDefaultFramebuffer());
             }(),
             "GetBaseTransformFlagsRaw: isDefaultFbo does not match the bound draw framebuffer");
@@ -6000,7 +6381,7 @@ void main() {
         // Entry select: by the draw program's lifetime id, MRU first (the id pins
         // the entry; every other fact is re-guarded below, so probing a stale
         // entry can only decline, never serve stale state).
-        const auto& program = *MG_State::pGLContext->GetProgramForDraw();
+        const auto& program = *MGB_CTX->GetProgramForDraw();
         const Uint64 programLifetimeId = program.GetLifetimeId();
         SetupDrawSnapshot* snapPtr = nullptr;
         {
@@ -6048,7 +6429,7 @@ void main() {
         // captured draw after glBeginTransformFeedback would bind the undecorated
         // variant and silently capture nothing while the CPU bookkeeping advances.
         const Bool wantsXfbCapture = m_transformFeedbackFeatureEnabled &&
-                                     MG_State::pGLContext->IsTransformFeedbackActive() &&
+                                     MGB_CTX->IsTransformFeedbackActive() &&
                                      program.GetTransformFeedbackVaryingCount() > 0;
         const Bool snapHasXfbCapture =
             static_cast<Bool>(ProgramFactory::CompileOptionFlags(snap.resolvedTransformFlags) &
@@ -6062,12 +6443,26 @@ void main() {
         // buffer binds (re-run every draw anyway). Declining here would send every
         // draw of a VAO-cycling stream (Minecraft chunk rendering) through the full
         // path, re-resolving descriptors and texture layouts nothing invalidated.
-        const auto& vao = *MG_State::pGLContext->GetBoundVertexArray();
+        const auto& vao = *MGB_CTX->GetBoundVertexArray();
+#if MOBILEGL_PIPE_PUSH
+        // P2 D12.4: the handle replaces the (address, lifetime id) pair here too - one
+        // compare instead of two, and the same identity the VAO draw memo is keyed on, so
+        // the two cannot disagree about whether "the VAO moved". The config version stays:
+        // it answers a different question (did this same object's layout change).
+        const Bool vaoMoved =
+            MagmaPipeTrackHArmIsHandles(MG_Pipe::kMGPipeSubsystemMagmaVertexInput)
+                ? (!(ResolveVaoHandle(vao) == snap.vaoHandle) ||
+                   vao.GetConfigVersion() != snap.vaoConfigVersion)
+                : (static_cast<const void*>(&vao) != snap.vao ||
+                   vao.GetLifetimeId() != snap.vaoLifetimeId ||
+                   vao.GetConfigVersion() != snap.vaoConfigVersion);
+#else
         const Bool vaoMoved =
             static_cast<const void*>(&vao) != snap.vao || vao.GetLifetimeId() != snap.vaoLifetimeId ||
             vao.GetConfigVersion() != snap.vaoConfigVersion;
+#endif
         const auto& drawFbo =
-            MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+            MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
         if (static_cast<const void*>(drawFbo.get()) != snap.drawFbo ||
             drawFbo->GetLifetimeId() != snap.drawFboLifetimeId ||
             drawFbo->GetObjectVersion() != snap.fboVersion) {
@@ -6078,8 +6473,8 @@ void main() {
         // back on what the snapshot already describes (a GL_BLEND toggle between
         // two draws, a redundant glBindSampler), and declining here sends every
         // such draw through the full SetupDraw.
-        const Uint renderStateVersion = MG_State::pGLContext->GetPipelineStateVersion();
-        const Uint64 bindGeneration = MG_State::pGLContext->GetTextureBindGeneration();
+        const Uint renderStateVersion = MGB_CTX->GetPipelineStateVersion();
+        const Uint64 bindGeneration = MGB_CTX->GetTextureBindGeneration();
         const Bool renderStateMoved = renderStateVersion != snap.renderStateVersion;
         const Bool bindsMoved = bindGeneration != snap.bindGeneration;
         if (renderStateMoved) {
@@ -6087,7 +6482,7 @@ void main() {
             // flavor input (depth/stencil participation); a flip of that must take
             // the full path's pass selection. One bulk parameters fetch instead of
             // two capability-accessor calls; both are pure reads of the same fields.
-            const RenderStateParameters& rsp = MG_State::pGLContext->GetRenderStateParameters();
+            const RenderStateParameters& rsp = MGB_CTX->GetRenderStateParameters();
             const Bool drawUsesDepthStencil = rsp.DepthTestEnabled || rsp.StencilTestEnabled;
             if (drawUsesDepthStencil != snap.drawUsesDepthStencil) {
                 return false;
@@ -6153,7 +6548,7 @@ void main() {
             Uint64 auxMasks = 0;
             Bool factsKnown = false;
             Uint64 contentHash = 0;
-            if (vao.GetBackendHashMemo(contentHash)) {
+            if (VaoContentHashIfKnown(vao, contentHash)) {
                 const VaoDrawMemo* vaoMemo = LookupVaoDrawMemo(&vao);
                 if (vaoMemo->layoutFactsValid && vaoMemo->contentHash == contentHash) {
                     vaoLayoutHash = vaoMemo->layoutHash;
@@ -6170,7 +6565,7 @@ void main() {
                 auxMasks = VertexInputStateFactory::PackVertexInputAuxMasks(
                     vertexInputState.unsupportedAttribMask, vertexInputState.attributeLocationMask);
                 Uint64 stampedHash = 0;
-                if (vao.GetBackendHashMemo(stampedHash)) {
+                if (VaoContentHashIfKnown(vao, stampedHash)) {
                     VaoDrawMemo* vaoMemo = LookupVaoDrawMemo(&vao);
                     vaoMemo->contentHash = stampedHash;
                     vaoMemo->layoutHash = vaoLayoutHash;
@@ -6261,7 +6656,7 @@ void main() {
         if (contentSum != snap.sampledContentSum || paramsSum != snap.sampledParamsSum) {
             return false;
         }
-        const Uint64 samplingResolutionGeneration = MG_State::pGLContext->GetSamplingResolutionGeneration();
+        const Uint64 samplingResolutionGeneration = MGB_CTX->GetSamplingResolutionGeneration();
         if (samplingResolutionGeneration != snap.samplingResolutionGeneration) {
             // Decline, not re-arm: snap.resolvedTransformFlags bakes the
             // ExplicitLod0Sampling verdict, which reads the effective sampler's
@@ -6291,6 +6686,18 @@ void main() {
             // what lets a per-draw GL_BLEND toggle alternate between two memo entries
             // instead of missing forever on a monotonic version. A miss falls through
             // to the full lookup.
+#if MOBILEGL_PIPE_PUSH
+            // Same arm selector as GetOrCreatePipeline's probe (P2 D12.1); this site is the
+            // fast path's copy of it, and the two must key identically or the fast path would
+            // hand back a pipeline the full path would not have matched.
+            const MG_Pipe::MGPipeHandle renderStateCso = ResolveBoundRenderStateCso();
+            const Uint64 pipelineStateHash =
+                !MG_Pipe::MGPipeHandleIsNull(renderStateCso)
+                    ? 0
+                    : ResolveFallbackPipelineStateHash(renderStateVersion, snap.renderPassColorCount,
+                                                       snap.renderPassSampleCount);
+#else
+            // The pull build's text, statement for statement (see GetOrCreatePipeline).
             if (!m_pipelineStateHashValid || m_pipelineStateHashVersion != renderStateVersion ||
                 m_pipelineStateHashColorCount != snap.renderPassColorCount ||
                 m_pipelineStateHashSampleCount != snap.renderPassSampleCount) {
@@ -6301,6 +6708,8 @@ void main() {
                 m_pipelineStateHashSampleCount = snap.renderPassSampleCount;
                 m_pipelineStateHashValid = true;
             }
+            const Uint64 pipelineStateHash = m_pipelineStateHash;
+#endif
             const auto memoTransformFlags =
                 ProgramFactory::CompileOptionFlags(snap.resolvedTransformFlags);
             for (Uint32 i = 0; i < m_pipelineMemoCount; ++i) {
@@ -6308,7 +6717,10 @@ void main() {
                 if (entry.pipeline != VK_NULL_HANDLE && entry.mode == mode &&
                     entry.programHash == programObj.hash && entry.vertexInputHash == vaoLayoutHash &&
                     entry.renderPassHash == snap.renderPassHash &&
-                    entry.pipelineStateHash == m_pipelineStateHash &&
+                    entry.pipelineStateHash == pipelineStateHash &&
+#if MOBILEGL_PIPE_PUSH
+                    entry.renderStateCso == renderStateCso &&
+#endif
                     entry.primitiveRestartEnable == drawPrimitiveRestartEnable &&
                     entry.transformFlags == memoTransformFlags) {
                     pipeline = entry.pipeline;
@@ -6342,6 +6754,15 @@ void main() {
         snap.bindGeneration = bindGeneration;
         snap.vao = static_cast<const void*>(&vao);
         snap.vaoLifetimeId = vao.GetLifetimeId();
+#if MOBILEGL_PIPE_PUSH
+        // Guarded by the SUBSYSTEM, not only by the build switch: with bit 6 clear the field
+        // is dead (vaoMoved takes the address/lifetime-id branch), and minting a handle for it
+        // would put this package's cost inside MOBILEGL_PIPE_PUSH=0 - the all-pull control arm
+        // D14 defines as reproducing P1 exactly, and the arm D.4.3's T2 is measured on.
+        if (MagmaPipeTrackHArmIsHandles(MG_Pipe::kMGPipeSubsystemMagmaVertexInput)) {
+            snap.vaoHandle = ResolveVaoHandle(vao);
+        }
+#endif
         snap.vaoConfigVersion = vao.GetConfigVersion();
         snap.vaoLayoutHash = vaoLayoutHash;
         snap.pipeline = pipeline;
@@ -6365,6 +6786,15 @@ void main() {
             MOBILEGL_ASSERT(idxUploadOk, "SetupDraw fast path: failed to upload index buffer");
         }
         ApplyDynamicDrawStateTail(frame, snap.renderPassExtent, snap.drawFboIsDefault, snap.viewportCount);
+        if (MG_Util::PipeStats::Enabled()) {
+            // The six accessor reads this function makes unconditionally on the path that
+            // reaches here: the draw program, the VAO, the draw-FBO slot, the pipeline
+            // state version, the texture bind generation and the sampling-resolution
+            // generation. The XFB-active probe is elided on a device without the feature
+            // and the parameter-block fetch only runs when the pipeline state version
+            // moved, so neither is counted (lower bound, as everywhere else).
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 6);
+        }
         return true;
     }
 
@@ -6382,7 +6812,7 @@ void main() {
             // was cancelled has no usable optimized module - and on an in-place
             // SanitizeAndOptimizeBinary failure GetGeneratedSpirv() still holds the RAW
             // glslang words, which must never reach vkCreateShaderModule. Drop the draw.
-            const auto& drawProgram = *MG_State::pGLContext->GetProgramForDraw();
+            const auto& drawProgram = *MGB_CTX->GetProgramForDraw();
             if (!drawProgram.GetLinkStatus() || !drawProgram.GetSpirvStatus()) {
                 MGLOG_D("SetupDraw skipped: program=%u is linked=%d spirv=%d",
                         drawProgram.GetExternalIndex(), static_cast<int>(drawProgram.GetLinkStatus()),
@@ -6390,19 +6820,37 @@ void main() {
                 return false;
             }
         }
+        if (MG_Util::PipeStats::Enabled()) {
+            // THE per-draw denominator for Magma, plus the draw-program read above. Placed
+            // here rather than inside TrySetupDrawFastPath because the fast path has 27
+            // decline returns and one success return: counting the gate from the caller is
+            // the only shape that cannot miss one.
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::Draws, 1);
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 1);
+        }
         if (TrySetupDrawFastPath(frame, mode, aspects, drawParams, pIndexBufferView)) {
+            if (MG_Util::PipeStats::Enabled()) {
+                MG_Util::PipeStats::CountGate(MG_Util::PipeStats::Gate::MagmaDrawFastPath, /*hit=*/true);
+            }
             return true;
         }
+        if (MG_Util::PipeStats::Enabled()) {
+            MG_Util::PipeStats::CountGate(MG_Util::PipeStats::Gate::MagmaDrawFastPath, /*hit=*/false);
+            // The three reads the full path makes immediately below (draw FBO, VAO,
+            // program). The accessor reads the declined fast path had already made before
+            // it turned back are NOT counted.
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::AccessorCalls, 3);
+        }
         const auto& drawFbo =
-                MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+                MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
         if (drawFbo != nullptr && IsUnsupportedFramebufferForDirectVulkan(*drawFbo)) {
             // Nothing was mutated: other entries' per-probe guards (FBO identity +
             // version among them) stay authoritative, so none need invalidating.
             RecordUnsupportedFramebufferError(__func__);
             return false;
         }
-        const auto& vao = *MG_State::pGLContext->GetBoundVertexArray();
-        const auto& program = *MG_State::pGLContext->GetProgramForDraw();
+        const auto& vao = *MGB_CTX->GetBoundVertexArray();
+        const auto& program = *MGB_CTX->GetProgramForDraw();
         // The fast path declined (or had no entry for this program): whatever THIS
         // program's entry saw may be stale, and the full path below mutates state as
         // it goes, so the entry must not stay matchable if that path fails mid-way.
@@ -6442,7 +6890,7 @@ void main() {
         ProgramFactory::CompileOptionFlags transformFlags =
             ProgramFactory::CompileOptionFlags(GetBaseTransformFlagsRaw(drawFboIsDefault));
         // Captured draws take the xfb-decorated program variant.
-        if (m_transformFeedbackFeatureEnabled && MG_State::pGLContext->IsTransformFeedbackActive() &&
+        if (m_transformFeedbackFeatureEnabled && MGB_CTX->IsTransformFeedbackActive() &&
             program.GetTransformFeedbackVaryingCount() > 0) {
             transformFlags |= ProgramFactory::CompileOptionBit::XfbCapture;
         }
@@ -6456,13 +6904,13 @@ void main() {
         {
             const Uint64 lodProgramLifetimeId = program.GetLifetimeId();
             const Uint32 lodProgramVersion = program.GetBackendStateVersion();
-            const Uint64 lodBindGeneration = MG_State::pGLContext->GetTextureBindGeneration();
+            const Uint64 lodBindGeneration = MGB_CTX->GetTextureBindGeneration();
             // The probe also reads the EFFECTIVE sampler's filters/aniso/LOD range
             // (ProgramSamplesOnlySingleLevelTextures), and those setters bump ONLY the
             // sampling-resolution generation - not the texture params version the sum
             // below covers. Without this key a filter/aniso change would keep serving
             // the stale verdict.
-            const Uint64 lodSamplingGeneration = MG_State::pGLContext->GetSamplingResolutionGeneration();
+            const Uint64 lodSamplingGeneration = MGB_CTX->GetSamplingResolutionGeneration();
             Bool lodMemoHit = false;
             if (m_lastLodDecisionValid && m_lastSampledSetValid &&
                 m_lastLodProgramLifetimeId == lodProgramLifetimeId &&
@@ -6580,7 +7028,7 @@ void main() {
         {
             const Uint64 programLifetimeId = program.GetLifetimeId();
             const Uint32 programVersion = program.GetBackendStateVersion();
-            const Uint64 bindGeneration = MG_State::pGLContext->GetTextureBindGeneration();
+            const Uint64 bindGeneration = MGB_CTX->GetTextureBindGeneration();
             // The bind generation alone stopped covering this set the moment ResolveSampledBinding
             // started asking SamplesAsIncompleteTexture: membership now depends on the effective
             // sampler PARAMETERS (MIN_FILTER decides whether the mip chain is read at all) and on
@@ -6599,7 +7047,7 @@ void main() {
             // object a unit carries goes through TextureUnit::SetSamplerObject and moves the bind
             // generation instead. Same term the SetupDrawSnapshot fast path and the LOD memo
             // already carry.
-            const Uint64 samplingGeneration = MG_State::pGLContext->GetSamplingResolutionGeneration();
+            const Uint64 samplingGeneration = MGB_CTX->GetSamplingResolutionGeneration();
             const Bool sampledSetUnchanged =
                 m_lastSampledSetValid && m_lastSampledSetProgramLifetimeId == programLifetimeId &&
                 m_lastSampledSetProgramVersion == programVersion &&
@@ -6760,8 +7208,8 @@ void main() {
         // pass flavor (GL: a disabled depth/stencil test neither reads nor writes
         // its buffer).
         const Bool drawUsesDepthStencil =
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::DepthTest) ||
-            MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::StencilTest);
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::DepthTest) ||
+            MGB_CTX->IsCapabilityEnabled(CapabilityInput::StencilTest);
         auto* renderPassEntry =
             m_renderPassManager->GetOrCreateRenderPass(*drawFbo, m_imageIndexAcquired, drawUsesDepthStencil);
         // nullptr: the framebuffer has an attachment DirectVulkan cannot represent (a texture the
@@ -6896,14 +7344,21 @@ void main() {
                 snap.programVersion = program.GetBackendStateVersion();
                 snap.vao = &vao;
                 snap.vaoLifetimeId = vao.GetLifetimeId();
+#if MOBILEGL_PIPE_PUSH
+                // Subsystem-guarded for the same reason as the other stamping site: the field
+                // is dead with bit 6 clear, and MOBILEGL_PIPE_PUSH=0 has to be P1 exactly.
+                if (MagmaPipeTrackHArmIsHandles(MG_Pipe::kMGPipeSubsystemMagmaVertexInput)) {
+                    snap.vaoHandle = ResolveVaoHandle(vao);
+                }
+#endif
                 snap.vaoConfigVersion = vao.GetConfigVersion();
                 snap.drawFbo = drawFbo.get();
                 snap.drawFboLifetimeId = drawFbo->GetLifetimeId();
                 snap.fboVersion = drawFbo->GetObjectVersion();
                 snap.drawFboIsDefault = drawFboIsDefault;
                 snap.viewportCount = ResolveDrawViewportCount(programObj.writesViewportIndexBuiltin);
-                snap.renderStateVersion = MG_State::pGLContext->GetPipelineStateVersion();
-                snap.bindGeneration = MG_State::pGLContext->GetTextureBindGeneration();
+                snap.renderStateVersion = MGB_CTX->GetPipelineStateVersion();
+                snap.bindGeneration = MGB_CTX->GetTextureBindGeneration();
                 snap.baseTransformFlags = GetBaseTransformFlagsRaw(drawFboIsDefault);
                 snap.resolvedTransformFlags = transformFlags.GetRaw();
                 snap.renderPassHash = nowActiveRenderPass->hash;
@@ -6929,7 +7384,7 @@ void main() {
                     snap.programObj = nullptr;
                     snap.programFactoryEpoch = 0;
                 }
-                snap.samplingResolutionGeneration = MG_State::pGLContext->GetSamplingResolutionGeneration();
+                snap.samplingResolutionGeneration = MGB_CTX->GetSamplingResolutionGeneration();
                 Uint64 snapContentSum = 0;
                 Uint64 snapParamsSum = 0;
                 // Per-entry copies of this draw's sampled set (the scratch vectors
@@ -6966,7 +7421,7 @@ void main() {
         auto& frame = m_frameContext.GetCurrent();
         // The DISPATCH accessor: with a pipeline bound this is its compute stage program
         // itself, never the graphics composite (which carries no compute stage at all).
-        const auto& program = *MG_State::pGLContext->GetProgramForDispatch();
+        const auto& program = *MGB_CTX->GetProgramForDispatch();
         if (!program.GetLinkStatus() || !program.GetSpirvStatus()) {
             MGLOG_E_ONCE("DispatchCompute skipped: program=%u has no optimized SPIR-V",
                     program.GetExternalIndex());
@@ -7018,7 +7473,7 @@ void main() {
         m_textureManager->CollectGarbage();
         auto& frame = m_frameContext.GetCurrent();
         // See DispatchCompute: the dispatch accessor, not the draw one.
-        const auto& program = *MG_State::pGLContext->GetProgramForDispatch();
+        const auto& program = *MGB_CTX->GetProgramForDispatch();
         if (!program.GetLinkStatus() || !program.GetSpirvStatus()) {
             MGLOG_E_ONCE("DispatchComputeIndirect skipped: program=%u has no optimized SPIR-V",
                     program.GetExternalIndex());
@@ -7062,7 +7517,7 @@ void main() {
             return;
         }
 
-        auto indirectBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DispatchIndirect).GetBoundObject();
+        auto indirectBuffer = MGB_CTX->GetBufferBindingSlot(BufferTarget::DispatchIndirect).GetBoundObject();
         if (!indirectBuffer) {
             MGLOG_E_ONCE("DispatchComputeIndirect skipped: GL_DISPATCH_INDIRECT_BUFFER is not bound");
             return;
@@ -7136,10 +7591,10 @@ void main() {
 
         VkClearRect clearRect{};
         clearRect.rect = framebuffer.IsDefaultFramebuffer()
-            ? MakeDefaultFramebufferScissorRect(MG_State::pGLContext->GetScissorBox(),
+            ? MakeDefaultFramebufferScissorRect(MGB_CTX->GetScissorBox(),
                                                 renderPassEntry->extent,
                                                 m_swapchainObject.GetPreTransform())
-            : MakeClampedScissorRect(MG_State::pGLContext->GetScissorBox(), renderPassEntry->extent);
+            : MakeClampedScissorRect(MGB_CTX->GetScissorBox(), renderPassEntry->extent);
         clearRect.baseArrayLayer = 0;
         // GL 3.3 §4.4.7: clearing a layered framebuffer clears every layer.
         clearRect.layerCount = renderPassEntry->layers;
@@ -7187,10 +7642,10 @@ void main() {
             return;
         }
         // GL 3.3 §3.1: when RASTERIZER_DISCARD is enabled, Clear and ClearBuffer* are ignored.
-        if (MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard)) {
+        if (MGB_CTX->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard)) {
             return;
         }
-        auto* fbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject().get();
+        auto* fbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject().get();
         MOBILEGL_ASSERT(fbo, "VulkanRenderer::Clear: draw framebuffer not found (fbo == nullptr)");
         if (IsUnsupportedFramebufferForDirectVulkan(*fbo)) {
             RecordUnsupportedFramebufferError(__func__);
@@ -7198,16 +7653,16 @@ void main() {
         }
 
         ClearFramebufferPayload payload {
-            .color = MG_State::pGLContext->GetClearColor(),
-            .depth = MG_State::pGLContext->GetClearDepth(),
-            .stencil = MG_State::pGLContext->GetClearStencil()
+            .color = MGB_CTX->GetClearColor(),
+            .depth = MGB_CTX->GetClearDepth(),
+            .stencil = MGB_CTX->GetClearStencil()
         };
 
         // A render-pass loadOp clear always covers the complete attachment, while
         // OpenGL glClear is clipped by GL_SCISSOR_TEST. Blaze3D relies on this for
         // GuiItemAtlas: animated items clear only their atlas slot before being
         // redrawn. Queueing that clear as a loadOp erases every cached static item.
-        if (MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
+        if (MGB_CTX->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
             VkClearRect clearRect{};
             switch (PrepareScissoredClear(*fbo, clearRect)) {
             case ScissoredClearPrep::NoOp:
@@ -7230,7 +7685,7 @@ void main() {
                             continue;
                         }
 
-                        const BoolVec4 colorMask = MG_State::pGLContext->GetColorMaskIndexed(drawBufferIndex);
+                        const BoolVec4 colorMask = MGB_CTX->GetColorMaskIndexed(drawBufferIndex);
                         if (!colorMask.r() && !colorMask.g() && !colorMask.b() && !colorMask.a()) {
                             continue;
                         }
@@ -7257,7 +7712,7 @@ void main() {
                 }
 
                 VkImageAspectFlags depthStencilAspects = 0;
-                if ((mask & GL_DEPTH_BUFFER_BIT) != 0 && MG_State::pGLContext->GetDepthMask()) {
+                if ((mask & GL_DEPTH_BUFFER_BIT) != 0 && MGB_CTX->GetDepthMask()) {
                     const auto& depthAttachment = fbo->GetAttachment(FramebufferAttachmentType::Depth);
                     if (depthAttachment.IsComplete()) {
                         depthStencilAspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -7270,7 +7725,7 @@ void main() {
                         // vkCmdClearAttachments writes every bit, so only a full (8-bit stencil) or
                         // zero mask can be expressed; treat a partial mask like a partial color mask.
                         const Uint32 stencilWriteMask =
-                            MG_State::pGLContext->GetStencilState(StencilFace::Front).WriteMask;
+                            MGB_CTX->GetStencilState(StencilFace::Front).WriteMask;
                         if ((stencilWriteMask & 0xFFu) == 0xFFu) {
                             depthStencilAspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
                         } else if (stencilWriteMask != 0) {
@@ -7299,11 +7754,11 @@ void main() {
         // gating for the deferred path: drop fully-masked planes, warn on partial
         // masks vkCmdClear*/loadOp clears cannot express.
         GLbitfield deferredMask = mask;
-        if ((deferredMask & GL_DEPTH_BUFFER_BIT) != 0 && !MG_State::pGLContext->GetDepthMask()) {
+        if ((deferredMask & GL_DEPTH_BUFFER_BIT) != 0 && !MGB_CTX->GetDepthMask()) {
             deferredMask &= ~static_cast<GLbitfield>(GL_DEPTH_BUFFER_BIT);
         }
         if ((deferredMask & GL_STENCIL_BUFFER_BIT) != 0) {
-            const Uint32 stencilWriteMask = MG_State::pGLContext->GetStencilState(StencilFace::Front).WriteMask;
+            const Uint32 stencilWriteMask = MGB_CTX->GetStencilState(StencilFace::Front).WriteMask;
             if ((stencilWriteMask & 0xFFu) != 0xFFu) {
                 if (stencilWriteMask != 0) {
                     MGLOG_W_ONCE("DirectVulkan: deferred glClear with a partial stencil write mask is not supported");
@@ -7319,7 +7774,7 @@ void main() {
                 if (drawBuffers[drawBufferIndex] == FramebufferAttachmentType::None) {
                     continue;
                 }
-                const BoolVec4 colorMask = MG_State::pGLContext->GetColorMaskIndexed(drawBufferIndex);
+                const BoolVec4 colorMask = MGB_CTX->GetColorMaskIndexed(drawBufferIndex);
                 const Bool full = colorMask.r() && colorMask.g() && colorMask.b() && colorMask.a();
                 if (full) {
                     anyFullMask = true;
@@ -7340,7 +7795,7 @@ void main() {
                     if (attachmentType == FramebufferAttachmentType::None) {
                         continue;
                     }
-                    const BoolVec4 colorMask = MG_State::pGLContext->GetColorMaskIndexed(drawBufferIndex);
+                    const BoolVec4 colorMask = MGB_CTX->GetColorMaskIndexed(drawBufferIndex);
                     if (!(colorMask.r() && colorMask.g() && colorMask.b() && colorMask.a())) {
                         continue;
                     }
@@ -7369,7 +7824,7 @@ void main() {
             const ClearAttachmentPayload& clearPayload) {
         m_clearManager->CollectGarbage();
         // GL 3.3 §3.1: when RASTERIZER_DISCARD is enabled, Clear and ClearBuffer* are ignored.
-        if (MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard)) {
+        if (MGB_CTX->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard)) {
             return;
         }
         if (IsUnsupportedFramebufferForDirectVulkan(framebuffer)) {
@@ -7411,7 +7866,7 @@ void main() {
         }
 
         // GL 3.3 §4.2.3: ClearBuffer* is clipped by GL_SCISSOR_TEST exactly like Clear.
-        if (MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
+        if (MGB_CTX->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
             VkClearRect clearRect{};
             switch (PrepareScissoredClear(framebuffer, clearRect)) {
             case ScissoredClearPrep::NoOp:
@@ -7442,9 +7897,9 @@ void main() {
 
         // GL 3.3 §4.2.3: ClearBuffer* honors the write masks like Clear. Deferred
         // clears cannot express partial masks; warn and skip those.
-        const auto depthClearAllowed = [&]() -> Bool { return MG_State::pGLContext->GetDepthMask(); };
+        const auto depthClearAllowed = [&]() -> Bool { return MGB_CTX->GetDepthMask(); };
         const auto stencilClearAllowed = [&]() -> Bool {
-            const Uint32 stencilWriteMask = MG_State::pGLContext->GetStencilState(StencilFace::Front).WriteMask;
+            const Uint32 stencilWriteMask = MGB_CTX->GetStencilState(StencilFace::Front).WriteMask;
             if ((stencilWriteMask & 0xFFu) == 0xFFu) {
                 return true;
             }
@@ -7456,7 +7911,7 @@ void main() {
 
         switch (buffer) {
             case GL_COLOR: {
-                const BoolVec4 colorMask = MG_State::pGLContext->GetColorMaskIndexed(static_cast<Uint32>(drawbuffer));
+                const BoolVec4 colorMask = MGB_CTX->GetColorMaskIndexed(static_cast<Uint32>(drawbuffer));
                 if (!colorMask.r() && !colorMask.g() && !colorMask.b() && !colorMask.a()) {
                     return;
                 }
@@ -7513,7 +7968,7 @@ void main() {
             if (!attachment.IsComplete()) {
                 return;
             }
-            const BoolVec4 colorMask = MG_State::pGLContext->GetColorMaskIndexed(static_cast<Uint>(drawbuffer));
+            const BoolVec4 colorMask = MGB_CTX->GetColorMaskIndexed(static_cast<Uint>(drawbuffer));
             if (!colorMask.r() && !colorMask.g() && !colorMask.b() && !colorMask.a()) {
                 return;
             }
@@ -7531,7 +7986,7 @@ void main() {
                 MakeVkClearColorValue(clearPayload, ColorFormatLacksAlpha(colorTexture));
         } else {
             VkImageAspectFlags aspects = 0;
-            if ((clearPayload.mask & GL_DEPTH_BUFFER_BIT) != 0 && MG_State::pGLContext->GetDepthMask() &&
+            if ((clearPayload.mask & GL_DEPTH_BUFFER_BIT) != 0 && MGB_CTX->GetDepthMask() &&
                 framebuffer.GetAttachment(FramebufferAttachmentType::Depth).IsComplete()) {
                 aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
             }
@@ -7539,7 +7994,7 @@ void main() {
                 framebuffer.GetAttachment(FramebufferAttachmentType::Stencil).IsComplete()) {
                 // GL 3.3 §4.2.3: the clear is masked by the front stencil write mask (see Clear).
                 const Uint32 stencilWriteMask =
-                    MG_State::pGLContext->GetStencilState(StencilFace::Front).WriteMask;
+                    MGB_CTX->GetStencilState(StencilFace::Front).WriteMask;
                 if ((stencilWriteMask & 0xFFu) == 0xFFu) {
                     aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
                 } else if (stencilWriteMask != 0) {
@@ -7558,7 +8013,7 @@ void main() {
 
     void VulkanRenderer::QueueClearBufferPayload(GLenum buffer, GLint drawbuffer,
                                                  const ClearAttachmentPayload& clearPayload) {
-        auto* fbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject().get();
+        auto* fbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject().get();
         if (!fbo) {
             return;
         }
@@ -8516,8 +8971,58 @@ void main() {
     void VulkanRenderer::BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                                          GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                                          GLbitfield mask, GLenum filter) {
-        auto readFbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
-        auto drawFbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5c (G6, CONTRACT-P5C §3.3/§5.4): MAGMA'S NAMED ARM. A blit record whose
+        // ReadFbo/DrawFbo are non-null is a glBlitNamedFramebuffer: both framebuffers resolve
+        // from the record's handles, and the sink is told the pair was consumed - a backend
+        // that leaves the flag clear has no named arm and the verb declines there, loudly.
+        // Magma has no FBO twin registry (it reads the frontend object wherever it syncs), so
+        // the resolution here is frontend-keyed - the handle was minted over the frontend
+        // object's lifetime id, and the two probes below (the client allocator's slot entry
+        // and the frontend context's framebuffer pool) are named debt inside the scope, the
+        // same shape as Espryt's StateForHandle arm: P7 retires it by carrying the object
+        // identity in the record. P5e (id), ruling 12: the third of Magma's four debts, so the
+        // scope it rides in is MagmaP7AllocatorDebtScope. Magma stays lockstep for the whole of
+        // P5e (CONTRACT-P5E §6.1), so the record being applied here is always barriered and the
+        // exemption still holds.
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            auto& applierState = MG_Pipe::MGPipeApplier();
+            const MG_Pipe::MGPipeHandle readHandle = applierState.VerbBlitReadFbo;
+            const MG_Pipe::MGPipeHandle drawHandle = applierState.VerbBlitDrawFbo;
+            if (!MG_Pipe::MGPipeHandleIsNull(readHandle) || !MG_Pipe::MGPipeHandleIsNull(drawHandle)) {
+                const auto resolveEndpoint = [](MG_Pipe::MGPipeHandle handle)
+                        -> SharedPtr<MG_State::GLState::FramebufferObject> {
+                    const MG_Pipe::MagmaP7AllocatorDebtScope magmaP7AllocatorDebt;
+                    if (handle == MG_Pipe::kMGPipeDefaultFramebuffer) {
+                        return MG_State::pGLContext ? MG_State::pGLContext->GetFramebufferObject(0) : nullptr;
+                    }
+                    if (!MG_Pipe::MGPipeSlots().IsLive(MG_Pipe::MGPipeKind::Framebuffer, handle)) {
+                        return nullptr;
+                    }
+                    const Uint64 lifetimeId =
+                        MG_Pipe::MGPipeSlots().LifetimeIdOfSlot(MG_Pipe::MGPipeKind::Framebuffer, handle.Slot);
+                    if (lifetimeId == 0 || MG_State::pGLContext == nullptr) return nullptr;
+                    return MG_State::pGLContext->FindFramebufferObjectByLifetimeId(lifetimeId);
+                };
+                auto readFbo = resolveEndpoint(readHandle);
+                auto drawFbo = resolveEndpoint(drawHandle);
+                if (!readFbo || !drawFbo) {
+                    // Leave the pair UNCONSUMED: the sink's decline is the loud answer a
+                    // missing endpoint deserves, not a silent blit of whatever is bound.
+                    MGLOG_E_ONCE("MGPipe: Magma's named blit could not resolve an endpoint (read {%u, %u}, draw "
+                                 "{%u, %u}) to a frontend framebuffer; the verb declines at the sink",
+                                 readHandle.Slot, readHandle.Gen, drawHandle.Slot, drawHandle.Gen);
+                    return;
+                }
+                applierState.VerbBlitNamedConsumed = true;
+                BlitNamedFramebuffer(readFbo, drawFbo, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0,
+                                     dstX1, dstY1, mask, filter);
+                return;
+            }
+        }
+#endif
+        auto readFbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
+        auto drawFbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
         BlitNamedFramebuffer(readFbo, drawFbo, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
     }
 
@@ -8549,8 +9054,8 @@ void main() {
 
         // The scissor test clips blit writes: intersect the destination rectangle with
         // the scissor box and shrink the source proportionally.
-        if (MG_State::pGLContext->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
-            const IntVec4& scissor = MG_State::pGLContext->GetScissorBox();
+        if (MGB_CTX->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
+            const IntVec4& scissor = MGB_CTX->GetScissorBox();
             const auto clipAxis = [](GLint& d0, GLint& d1, GLint& s0, GLint& s1, GLint clipLo, GLint clipHi) -> Bool {
                 const Bool dstFlipped = d1 < d0;
                 GLint lo = dstFlipped ? d1 : d0;
@@ -9144,7 +9649,7 @@ void main() {
             return;
         }
 
-        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit());
+        auto& textureUnit = MGB_CTX->GetTextureUnitObject(MGB_CTX->GetActiveTextureUnit());
         auto destinationTexture = textureUnit.GetBindingSlot(textureTarget).GetBoundObject();
         if (destinationTexture == nullptr) {
             RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
@@ -9152,7 +9657,7 @@ void main() {
             return;
         }
 
-        auto readFbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
+        auto readFbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
         if (readFbo == nullptr) {
             RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
                                    "CopyTexSubImage2D requires a framebuffer bound to GL_READ_FRAMEBUFFER.");
@@ -9863,7 +10368,7 @@ void main() {
             return;
         }
 
-        auto readFbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
+        auto readFbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
         if (readFbo == nullptr) {
             MGLOG_E_ONCE("DirectVulkan::ReadPixels skipped: no read framebuffer is bound");
             return;
@@ -10618,8 +11123,8 @@ void main() {
 
         // Store honoring the client pack state (single slice).
         const auto& pixelPackBufferObject =
-            MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::PixelPack).GetBoundObject();
-        const auto packParams = MG_State::pGLContext->GetPixelStoreParameters(false);
+            MGB_CTX->GetBufferBindingSlot(BufferTarget::PixelPack).GetBoundObject();
+        const auto packParams = MGB_CTX->GetPixelStoreParameters(false);
         const SizeT rowPixels = static_cast<SizeT>(packParams.RowLength > 0 ? packParams.RowLength : width);
         const SizeT packAlignment = packParams.Alignment > 0 ? static_cast<SizeT>(packParams.Alignment) : 1;
         const SizeT dstRowStride = ((rowPixels * dstPixelBytes) + packAlignment - 1) / packAlignment * packAlignment;
@@ -10649,7 +11154,7 @@ void main() {
     void VulkanRenderer::GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels) {
         const auto textureUploadTarget = MG_Util::ConvertGLEnumToTextureUploadTarget(target);
         const auto textureTarget = MG_Util::ConvertGLEnumToTextureTarget(target);
-        auto& activeUnit = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit());
+        auto& activeUnit = MGB_CTX->GetTextureUnitObject(MGB_CTX->GetActiveTextureUnit());
         auto textureObject = activeUnit.GetBindingSlot(textureTarget).GetBoundObject();
         GetTextureImage(textureObject, textureUploadTarget, level, format, type, -1, pixels);
     }
@@ -10893,7 +11398,7 @@ void main() {
             return;
         }
 
-        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit());
+        auto& textureUnit = MGB_CTX->GetTextureUnitObject(MGB_CTX->GetActiveTextureUnit());
         auto texture = textureUnit.GetBindingSlot(textureTarget).GetBoundObject();
         MOBILEGL_ASSERT(texture != nullptr, "GenerateMipmap requires a bound texture.");
         MOBILEGL_ASSERT(texture->IsComplete(), "GenerateMipmap requires a complete texture.");
@@ -10956,7 +11461,17 @@ void main() {
                             "GenerateMipmap: depth-stencil mipmap generation is not supported yet.");
         }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5c (T5 / tx): under an active transport the generated chain is defined on the
+        // server's staged shadow (keyed by the synced TextureResource above) and the client's
+        // level storage is never written; in monolith the client-object path runs unchanged.
+        const Bool allocatedMipmapStorage =
+            MG_Config::Transport != MG_Config::TransportMode::Monolith
+                ? EnsureGenerateMipmapShadowAllocated(*resource, baseMipLevel, texture->GetUploadTargets())
+                : EnsureGenerateMipmapStorageAllocated(*mipmapTexture, baseMipLevel);
+#else
         const Bool allocatedMipmapStorage = EnsureGenerateMipmapStorageAllocated(*mipmapTexture, baseMipLevel);
+#endif
         MOBILEGL_ASSERT(allocatedMipmapStorage, "GenerateMipmap could not allocate a full mip chain for this texture.");
 
         resource = m_textureManager->SyncTextureAndGetDescriptor(*texture);
@@ -11133,31 +11648,81 @@ void main() {
         }
     }
 
+    // Keyed on the frontend's never-reused lifetime id, NOT on the GL name. The name is
+    // recycled the moment glDeleteTransformFeedbacks gives it back, so a name-keyed slot
+    // handed a brand-new object the counter group - and the m_xfbCountersValid /
+    // m_xfbLastSeenGeneration entries - of the object that died under that name.
+    //
+    // Slots are never handed back (there is no backend entry telling this renderer that a span
+    // closed - registering the EndTransformFeedback one would flip the "captures through its own
+    // driver" test FixupGsStripCaptureOrder makes of it), so once all sixteen are owned a new
+    // object has to take one over. The victim is chosen among owners with NO OPEN SPAN: an object
+    // whose span is closed, or which no longer exists at all, can never resume, so its counter
+    // bytes are dead. Least-recently-used ALONE would be exactly the wrong rule - GL only permits
+    // another object to capture while this one is PAUSED, so the paused span whose counters the
+    // slots exist to protect is by construction the least recently used entry. Taking a group over
+    // resets its counter state, because those bytes describe the previous owner's span.
     Uint32 VulkanRenderer::CurrentXfbCounterSlot() {
-        const Uint name = MG_State::pGLContext->GetBoundTransformFeedbackName();
-        const auto it = m_xfbCounterSlotByObject.find(name);
-        if (it != m_xfbCounterSlotByObject.end()) {
-            return it->second;
+        constexpr Uint32 kNoSlot = static_cast<Uint32>(kXfbCounterObjectSlots);
+        const Uint64 identity = MGB_CTX->GetBoundTransformFeedbackLifetimeId();
+        MOBILEGL_ASSERT(identity != 0,
+                        "transform feedback object reported the free-slot sentinel (0) as its identity - "
+                        "every slot would then read as 'mine' without ever being claimed");
+        Uint32 freeSlot = kNoSlot;
+        for (Uint32 slot = 0; slot < kNoSlot; ++slot) {
+            if (m_xfbCounterSlotOwner[slot] == identity) {
+                m_xfbCounterSlotLastUse[slot] = ++m_xfbCounterSlotUseSerial;
+                return slot;
+            }
+            if (m_xfbCounterSlotOwner[slot] == 0 && freeSlot == kNoSlot) {
+                freeSlot = slot;
+            }
         }
-        // Past the tracked set every object shares slot group 0. Only concurrently-paused
-        // spans need distinct groups, and applications do not keep sixteen of those open.
-        const Uint32 slot = m_xfbNextCounterSlot < kXfbCounterObjectSlots ? m_xfbNextCounterSlot++ : 0;
-        m_xfbCounterSlotByObject[name] = slot;
+        Uint32 slot = freeSlot;
+        if (slot == kNoSlot) {
+            for (Uint32 candidate = 0; candidate < kNoSlot; ++candidate) {
+                if (MGB_CTX->HasOpenTransformFeedbackSpan(m_xfbCounterSlotOwner[candidate])) {
+                    continue;
+                }
+                if (slot == kNoSlot || m_xfbCounterSlotLastUse[candidate] < m_xfbCounterSlotLastUse[slot]) {
+                    slot = candidate;
+                }
+            }
+        }
+        if (slot == kNoSlot) {
+            // Sixteen capture spans open at once. Whatever is taken loses its resume offset and
+            // restarts at byte 0 of its capture buffers, which is a wrong picture rather than a
+            // slow one - hence a report rather than a silent choice.
+            MGLOG_E_ONCE("CurrentXfbCounterSlot: all %zu counter groups belong to transform feedback objects "
+                         "with an open capture span; the least recently used one is taken over and that span "
+                         "will restart at offset 0 instead of appending",
+                         kXfbCounterObjectSlots);
+            slot = 0;
+            for (Uint32 candidate = 1; candidate < kNoSlot; ++candidate) {
+                if (m_xfbCounterSlotLastUse[candidate] < m_xfbCounterSlotLastUse[slot]) {
+                    slot = candidate;
+                }
+            }
+        }
+        m_xfbCounterSlotOwner[slot] = identity;
+        m_xfbCounterSlotLastUse[slot] = ++m_xfbCounterSlotUseSerial;
+        m_xfbCountersValid[slot] = false;
+        m_xfbLastSeenGeneration[slot] = 0;
         return slot;
     }
 
     Bool VulkanRenderer::BeginXfbCaptureForDraw(FrameContext::FrameData& frame) {
-        if (!m_transformFeedbackFeatureEnabled || MG_State::pGLContext == nullptr ||
-            !MG_State::pGLContext->IsTransformFeedbackActive()) {
+        if (!m_transformFeedbackFeatureEnabled || !MGB_CTX_LIVE ||
+            !MGB_CTX->IsTransformFeedbackActive()) {
             return false;
         }
         // A paused span captures nothing, and the counter buffers keep their values, so the
         // next resumed draw appends exactly where the last captured one stopped - which is
         // what pause/resume means (ARB_transform_feedback2).
-        if (MG_State::pGLContext->IsTransformFeedbackPaused()) {
+        if (MGB_CTX->IsTransformFeedbackPaused()) {
             return false;
         }
-        const auto& program = MG_State::pGLContext->GetTransformFeedbackProgram();
+        const auto& program = MGB_CTX->GetTransformFeedbackProgram();
         if (!program || program->GetTransformFeedbackVaryingCount() == 0) {
             return false;
         }
@@ -11196,7 +11761,7 @@ void main() {
         VkDeviceSize offsets[4] = {};
         VkDeviceSize sizes[4] = {};
         for (SizeT i = 0; i < bufferCount; ++i) {
-            auto& point = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::TransformFeedback,
+            auto& point = MGB_CTX->GetBufferBindingPoint(BufferTarget::TransformFeedback,
                                                                       static_cast<Uint>(i));
             const auto& bufferObject = point.GetBoundObject();
             if (bufferObject == nullptr) {
@@ -11207,7 +11772,13 @@ void main() {
             // have happened, so the buffer is also flagged for the wait that a later CPU
             // read has to perform - the capture is a GPU write like any shader's.
             bufferObject->EnsureGpuResidentStorage();
+#if MOBILEGL_PIPE_PUSH
+            // P5c ev (R2, CONTRACT-P5C §4.2): through the reverse channel, not a direct poke
+            // of the client object from the apply thread.
+            MG_Pipe::MGPipeAnnounceBufferGpuWritten(bufferObject);
+#else
             bufferObject->MarkGpuWritten();
+#endif
             BufferSlice slice{};
             if (!m_bufferManager.AcquireResidentSlice(BufferKind::Vertex, bufferObject, slice)) {
                 MGLOG_E_ONCE("BeginXfbCaptureForDraw: failed to acquire capture buffer %zu", i);
@@ -11227,7 +11798,7 @@ void main() {
                                                offsets, sizes);
 
         const Uint32 counterSlot = CurrentXfbCounterSlot();
-        const Uint64 generation = MG_State::pGLContext->GetTransformFeedbackGeneration();
+        const Uint64 generation = MGB_CTX->GetTransformFeedbackGeneration();
         const Bool resume = m_xfbCountersValid[counterSlot] && m_xfbLastSeenGeneration[counterSlot] == generation;
         m_xfbLastSeenGeneration[counterSlot] = generation;
 
@@ -11250,7 +11821,7 @@ void main() {
         if (!began) {
             return;
         }
-        const auto& program = MG_State::pGLContext->GetTransformFeedbackProgram();
+        const auto& program = MGB_CTX->GetTransformFeedbackProgram();
         const SizeT bufferCount = program ? std::min<SizeT>(program->GetTransformFeedbackBufferCount(), 4) : 0;
         const Uint32 counterSlot = CurrentXfbCounterSlot();
         VkBuffer counterBuffers[4] = {};
@@ -11898,7 +12469,7 @@ void main() {
             default: break;
         }
         if (mergeGranularity != 0) {
-            const RenderStateParameters& rsp = MG_State::pGLContext->GetRenderStateParameters();
+            const RenderStateParameters& rsp = MGB_CTX->GetRenderStateParameters();
             if (rsp.PrimitiveRestartEnabled || rsp.PrimitiveRestartFixedIndexEnabled) {
                 mergeGranularity = 0;
             }
@@ -11976,7 +12547,7 @@ void main() {
             return;
         }
 
-        const auto& vao = *MG_State::pGLContext->GetBoundVertexArray();
+        const auto& vao = *MGB_CTX->GetBoundVertexArray();
         const auto* indexBuffer = vao.GetIndexBufferBindingSlot().GetBoundObject().get();
         if (!indexBuffer) {
             MGLOG_E_ONCE("MultiDrawElementsIndirectCount skipped: no element array buffer is bound");
@@ -11986,13 +12557,13 @@ void main() {
         const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
         const SizeT commandBytes = commandOffset +
             static_cast<SizeT>(stride) * static_cast<SizeT>(maxdrawcount - 1) + kGLDrawElementsIndirectCommandBytes;
-        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        auto drawBuffer = MGB_CTX->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
         if (!drawBuffer || commandBytes > drawBuffer->GetSize()) {
             MGLOG_E_ONCE("MultiDrawElementsIndirectCount skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range");
             return;
         }
 
-        auto parameterBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::Parameter).GetBoundObject();
+        auto parameterBuffer = MGB_CTX->GetBufferBindingSlot(BufferTarget::Parameter).GetBoundObject();
         if (!parameterBuffer || static_cast<SizeT>(drawcount) + sizeof(Uint32) > parameterBuffer->GetSize()) {
             MGLOG_E_ONCE("MultiDrawElementsIndirectCount skipped: invalid GL_PARAMETER_BUFFER binding or range");
             return;
@@ -12077,7 +12648,7 @@ void main() {
             return;
         }
 
-        const auto& vao = *MG_State::pGLContext->GetBoundVertexArray();
+        const auto& vao = *MGB_CTX->GetBoundVertexArray();
         const auto* indexBuffer = vao.GetIndexBufferBindingSlot().GetBoundObject().get();
         if (!indexBuffer) {
             MGLOG_E_ONCE("MultiDrawElementsIndirect skipped: no element array buffer is bound");
@@ -12087,7 +12658,7 @@ void main() {
         const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
         const SizeT commandBytes = commandOffset +
             static_cast<SizeT>(stride) * static_cast<SizeT>(drawcount - 1) + kGLDrawElementsIndirectCommandBytes;
-        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        auto drawBuffer = MGB_CTX->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
         if (!drawBuffer || commandBytes > drawBuffer->GetSize()) {
             MGLOG_E_ONCE("MultiDrawElementsIndirect skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range");
             return;
@@ -12157,7 +12728,7 @@ void main() {
         const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
         const SizeT commandBytes = commandOffset +
             static_cast<SizeT>(stride) * static_cast<SizeT>(drawcount - 1) + kGLDrawArraysIndirectCommandBytes;
-        auto drawBuffer = MG_State::pGLContext->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
+        auto drawBuffer = MGB_CTX->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
         if (!drawBuffer || commandBytes > drawBuffer->GetSize()) {
             MGLOG_E_ONCE("MultiDrawArraysIndirect skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range");
             return;
@@ -12406,6 +12977,14 @@ void main() {
         if (m_vertexInputStateFactory) {
             m_vertexInputStateFactory->OnFrameBoundary();
         }
+#if MOBILEGL_PIPE_PUSH
+        // Reclaim {slot, gen} for objects that have not been drawn for a long time, on the same
+        // cadence and the same retirement age as the entries those slots key. This is the
+        // stand-in for the frontend death notification P2 has no hook for, and it is what keeps
+        // the mint's footprint the LIVE working set rather than every object ever created
+        // (review v2 MAJOR 1 / MAJOR 3).
+        m_pipeIdentity.OnFrameBoundary();
+#endif
         if (m_samplerManager) {
             m_samplerManager->OnFrameBoundary();
         }
@@ -12646,8 +13225,8 @@ void main() {
         if (!m_provokingVertexModePerPipeline) {
             return VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
         }
-        return (MG_State::pGLContext != nullptr &&
-                MG_State::pGLContext->GetProvokingVertexMode() == ProvokingVertexMode::FirstVertex)
+        return (MGB_CTX_LIVE &&
+                MGB_CTX->GetProvokingVertexMode() == ProvokingVertexMode::FirstVertex)
                    ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
                    : VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
     }
@@ -12771,6 +13350,9 @@ void main() {
             InvalidateSetupDrawSnapshots();
         }
         m_vertexInputStateFactory->OnFrameBoundary();
+#if MOBILEGL_PIPE_PUSH
+        m_pipeIdentity.OnFrameBoundary();
+#endif
         m_samplerManager->OnFrameBoundary();
         auto& frame = m_frameContext.GetCurrent();
         auto* activeRenderPass = VkRenderPassManager::GetActiveRenderPass();

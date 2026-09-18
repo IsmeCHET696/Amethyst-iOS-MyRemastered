@@ -1,0 +1,284 @@
+// MobileGL - MobileGL/MG_Impl/Pipe/SlotAllocator.h
+// Copyright (c) 2025-2026 MobileGL-Dev
+// Licensed under the GNU Lesser General Public License v3.0:
+//   https://www.gnu.org/licenses/gpl-3.0.txt
+//   https://www.gnu.org/licenses/lgpl-3.0.txt
+// SPDX-License-Identifier: LGPL-3.0-only
+// End of Source File Header
+
+#pragma once
+#include <Includes.h>
+
+#include <MG_Pipe/MGPipeHandles.h>
+
+// The CLIENT's slot allocator: the thing that mints every MGPipeHandle in the system
+// (ARCHITECTURE.md 4.2 - no create_* call in the catalogue returns a server-cast handle,
+// which is what lets the whole catalogue be remoted with zero creation round trips).
+//
+// Per kind: a free list plus a high-water mark, so slots stay DENSE and the server's object
+// table is an array rather than a hash map. It has nothing to do with MG_State's
+// IndexGenerator - that container's LIFO GL-name reuse is the very problem {slot, gen}
+// exists to close, and the whole point of the identity is that an ABA on the GL name, on
+// the heap address or on the lifetime id cannot reproduce a handle.
+//
+// Gen increments ONLY when a slot is reused, never on a respecify: a glBufferData on a live
+// buffer keeps the same {slot, gen}, because the object is the same object. Two generations
+// exist in the design and they are strictly separate - this is the client's answer to "is
+// this still the same GL object"; MGGen is the server's epoch for "did I recast my driver
+// object", and no MGPipe call may require the client to know it.
+//
+// The lifetimeId -> slot map is what keeps a GL NAME out of every key (ARCHITECTURE.md 4.2):
+// the frontend object's lifetime id is the client's own identity for it, so the backend key
+// is the handle and the frontend key is the lifetime id, and neither is a recyclable name.
+//
+// Lives in MG_Impl (the client side, unrestricted) and is compiled only under
+// MOBILEGL_PIPE_PUSH. It is in the P2 CONTRACT commit rather than in a Track H package
+// because both Track H slices - Espryt 0b and Magma subsystem 4 - key off it.
+namespace MobileGL::MG_Pipe {
+
+    class MGPipeSlotAllocator {
+    public:
+        static constexpr SizeT kKindCount = static_cast<SizeT>(MGPipeKind::KindCount);
+
+        // A fresh {slot, gen} of this kind, from the free list if one is waiting and from the
+        // high-water mark otherwise. Never returns slot 0 (reserved: null, and the default
+        // framebuffer for kind Framebuffer), and never returns a ShaderCso slot inside the
+        // composite band, which the program-pipeline resolver mints out of separately.
+        MGPipeHandle Allocate(MGPipeKind kind);
+        // Allocate and remember `lifetimeId` as this handle's frontend identity.
+        MGPipeHandle AllocateFor(MGPipeKind kind, Uint64 lifetimeId);
+
+        // P4a, D-H7: THE ONE ENTRY POINT INTO THE ShaderCso COMPOSITE BAND, and the only one
+        // there will ever be. Allocate() above refuses that band on purpose, so a program
+        // pipeline's flattened composite - minted client-side from the stage programs bound to
+        // the pipeline object, and indistinguishable from an ordinary program to the server -
+        // needs a door of its own rather than a flag on the handle. The kind is implied: only
+        // ShaderCso has a band.
+        //
+        // It behaves exactly like AllocateFor in every other respect (free list first, then
+        // the band's own high-water mark; Gen moves only on reuse; the lifetimeId -> slot map
+        // is written) and it carries the band's own exhaustion assert, so exhausting the
+        // composite space is a NAMED Fatal rather than silent slot theft from ordinary
+        // programs. Returns kMGPipeNullHandle when the band is full.
+        //
+        // Freed through the ordinary Free(MGPipeKind::ShaderCso, handle): a composite's slot
+        // has two independent release paths - the pipeline cache's LRU eviction and the
+        // composite ProgramObject's own destructor - and Free refusing a slot that is not live
+        // at that generation is what makes the second one a proven no-op.
+        MGPipeHandle AllocateComposite(Uint64 lifetimeId);
+        // The handle a lifetime id was allocated for, or kMGPipeNullHandle. A recycled heap
+        // address does NOT reproduce a mapping: MG_State hands out a fresh lifetime id per
+        // object, so the map key is unique for the life of the process.
+        MGPipeHandle FindByLifetimeId(MGPipeKind kind, Uint64 lifetimeId) const;
+        // FindByLifetimeId, then AllocateFor when it misses. The ordinary client path.
+        MGPipeHandle Acquire(MGPipeKind kind, Uint64 lifetimeId);
+
+        // Returns the slot to the free list. The Gen bump happens on the NEXT handout of that
+        // slot, not here, so a handle that is freed twice cannot skip a generation and the
+        // "gen moves only on reuse" contract holds for an object that is never reused.
+        void Free(MGPipeKind kind, MGPipeHandle handle);
+
+        Bool IsLive(MGPipeKind kind, MGPipeHandle handle) const;
+        // 0 for a slot that was never handed out; the generation of the LAST handout
+        // otherwise, live or not.
+        Uint32 GenOfSlot(MGPipeKind kind, Uint32 slot) const;
+        Uint64 LifetimeIdOfSlot(MGPipeKind kind, Uint32 slot) const;
+        // One past the highest ORDINARY slot ever handed out of this kind. For every kind but
+        // ShaderCso that is the whole story; for ShaderCso the composite band is a second,
+        // separately dense space and CompositeHighWater() below answers it.
+        //
+        // THE TWO SPACES ARE REPORTED SEPARATELY, and that is the point rather than a detail.
+        // Folding the band into this number pins it at ~983k from the first composite mint
+        // onward, and every later assertion of the "the high-water mark did not move over N
+        // churn rounds" shape - the one that catches a dense table that never shrinks, which
+        // is the ~1.3 KB-per-record leak C-1 produced - becomes vacuously true for ordinary
+        // ShaderCso slots for the rest of the process. A leak case per space is two real
+        // assertions; one merged number is one real assertion and one that cannot go red.
+        //
+        // It is also NOT a table size for kind ShaderCso even now: the band is sparse against
+        // the ordinary space by design, so a consumer indexing by slot must test
+        // MGPipeIsCompositeShaderSlot(slot) first and keep the band in a table of its own,
+        // exactly as this allocator does.
+        Uint32 HighWater(MGPipeKind kind) const;
+        // One past the highest COMPOSITE slot ever handed out, i.e.
+        // kMGPipeShaderCsoCompositeSlotBase + (band slots ever handed out), and exactly the
+        // base when none ever was. Kind ShaderCso is the only kind with a band, so it is
+        // implied - as it is for AllocateComposite. A LEAKED COMPOSITE MOVES THIS and moves
+        // nothing else, which is what the composite's own leak case asserts on.
+        Uint32 CompositeHighWater() const;
+        // Live slots of this kind, ORDINARY AND COMPOSITE TOGETHER for ShaderCso: a live
+        // composite is a live ShaderCso, the applier's two record tables are one object class,
+        // and a caller asking "how many shader CSOs does this client hold" wants both. The
+        // band's own count is CompositeLiveCount(); the ordinary space's is the difference.
+        Uint32 LiveCount(MGPipeKind kind) const;
+        Uint32 CompositeLiveCount() const;
+        // Slots waiting on a free list. Also BOTH SPACES for ShaderCso, for LiveCount's
+        // reason and with the same caveat: a caller that needs to know WHICH space a slot went
+        // back to reads CompositeFreeCount() and subtracts.
+        Uint32 FreeCount(MGPipeKind kind) const;
+        Uint32 CompositeFreeCount() const;
+
+        // Context teardown / server reset / a unit test's fixture.
+        void Reset();
+
+    private:
+        struct SlotState {
+            Uint32 Gen = 0;
+            Bool Live = false;
+            Bool EverHandedOut = false;
+            Uint64 LifetimeId = 0;
+        };
+
+        struct KindState {
+            // Indexed by slot; [0] is the reserved slot and is never live.
+            Vector<SlotState> Slots;
+            Vector<Uint32> FreeList;
+            // P4a: the ShaderCso COMPOSITE band, indexed by (slot - the band's base) and
+            // EMPTY for every other kind. A SECOND VECTOR RATHER THAN MORE OF THE FIRST, and
+            // it is not a micro-optimisation: the band starts at 983040, so minting one
+            // composite into the slot-indexed vector above would allocate ~983k SlotStates -
+            // ~23 MB - for a single program pipeline, and a consumer that sized a table off
+            // HighWater would pay the same shape again with a far bigger record. Both spaces
+            // stay dense against their own high-water mark, which is the property this
+            // allocator exists to give the server.
+            Vector<SlotState> BandSlots;
+            Vector<Uint32> BandFreeList;
+            UnorderedMap<Uint64, Uint32> ByLifetimeId;
+            Uint32 LiveCount = 0;
+            // The band's share of LiveCount above, so the two spaces can be reported apart
+            // without walking either table. Always 0 for every kind but ShaderCso.
+            Uint32 BandLiveCount = 0;
+        };
+
+        KindState& StateOf(MGPipeKind kind);
+        const KindState& StateOf(MGPipeKind kind) const;
+        // The SlotState a (kind, slot) names, in whichever of the two vectors holds it, or
+        // null when the slot has never been handed out. One resolver, so a caller that forgets
+        // the band cannot exist.
+        static SlotState* EntryOf(KindState& state, MGPipeKind kind, Uint32 slot);
+        static const SlotState* EntryOf(const KindState& state, MGPipeKind kind, Uint32 slot);
+
+        Array<KindState, kKindCount> m_kinds{};
+    };
+
+    // The monolith's one client allocator. Under split there is one per client context.
+    MGPipeSlotAllocator& MGPipeSlots();
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // P5c (hd, CONTRACT-P5C §3.1 / §6 layer 1): with an active transport this allocator is a
+    // CLIENT-only surface. Acquire, FindByLifetimeId and Free called from the apply thread -
+    // i.e. a server that resolves or mints handles off a frontend object's lifetime id (T2),
+    // which is memory that will not exist on its side of a real split - are
+    // Fatal{RoleViolation, "MGPipeSlots"}. Compiled out entirely outside split builds, so the
+    // pull build's bytes do not move (G1).
+    void MGPipeRefuseAllocatorFromApplyThread(const char* entry);
+
+    // ---- P5e (id, CONTRACT-P5E §4.4): THE CONDITION UNDER WHICH A NAMED SCOPE EXEMPTS -----
+    //
+    // "This thread is applying a record the client is NOT parked behind." Both scopes below
+    // exempt a probe only while it is FALSE, because the client's wait is the whole of what
+    // makes a frontend read from the apply thread safe: behind a barriered record the client
+    // is blocked in WaitForApplied and its memory is stable; behind an unbarriered one it is
+    // running ahead and the same read is torn or stale BY CONSTRUCTION, which is why rule F
+    // has no "count it" arm and this answer does not consult MOBILEGL_IPC_STRICT_ERRORS.
+    //
+    // False in a monolith process and on any thread but the apply thread, so a GL-thread
+    // caller is never refused by it.
+    Bool MGPipeApplierIsUnbarrieredApply();
+
+    // The refusal for the frontend-keyed surfaces that do NOT touch the allocator and so are
+    // not covered by MGPipeRefuseAllocatorFromApplyThread: the state note, its reader, and
+    // ForEachLive's weak-reference walk (SlotTables.h). They survive P5e as MONOLITH GLUE
+    // (CONTRACT-P5E §5.8) and this is what keeps that claim honest - reaching one of them from
+    // an unbarriered apply is Fatal{RoleViolation, "MGPipeSlots"} naming the member, not a
+    // silently stale SharedPtr. Same name in the refusal as the allocator guard's on purpose:
+    // it is one surface, "server memory keyed by frontend identity", and a reader chasing the
+    // abort should land on the same rule either way.
+    void MGPipeRefuseFrontendKeyedRegistryFromUnbarrieredApply(const char* entry);
+
+    // The NAMED EXEMPTION to the rule above (CONTRACT-P5C §3.1, as amended by CONTRACT-P5E
+    // §4.4): the family of sites whose handle-carrying records the client does not EMIT yet.
+    // set_shader_buffers and set_stream_output_targets exist in the catalogue but are P4b/sb's
+    // to emit (SetHashSuppressor.h says so), so the buffer binding-point ensures and the
+    // GPU-written announcement they feed have no record handle to resolve from today. Inside
+    // this scope ONE read-only lifetime-id probe stays legal WHILE THE CURRENT RECORD IS
+    // BARRIERED; the scope is the debt's measurable, greppable form, and it retires with P7's
+    // server-side binding table. Every other apply-thread allocator access stays Fatal.
+    //
+    // THE DEPTH IS COUNTED ONLY ON THE APPLY THREAD (P5d round 3, package D). The counter's
+    // only reader is MGPipeRefuseAllocatorFromApplyThread, which returns before it looks unless
+    // ServerLoop::OnApplyThread() is true, so a depth kept on any OTHER thread could never
+    // change an answer - it was pure cost. The query is called ActiveOnApplyThread() and not
+    // Active() BECAUSE OF THAT (review round 3): a name that promised "is a scope open" would
+    // now be quietly answering "is a scope open ON THE APPLY THREAD", and the next reader to
+    // come along - a P4b/P7 probe deciding on the GL thread whether to emit a record - would
+    // read a truthful-looking false and take the wrong branch with nothing to warn it. The name
+    // carries the precondition so a second reader has to notice it. m_counted remembers what the constructor decided so
+    // the destructor undoes exactly what the constructor did; asking the predicate twice would
+    // leak a count for a scope that outlived the apply thread. On the GL thread (and in every
+    // monolith process) both ends are now one inlined predicate and a branch instead of an
+    // emutls call, which is where 32.7% of the monolith GL thread's __emutls_get_address - its
+    // top symbol at 7.7% - was going.
+    //
+    // P5e (id), ruling 12: RENAMED FROM MGPipeReverseAnnouncementScope AND KEYED ON THE
+    // BACKEND KIND. The rename is the finding: what is left inside it after P5e is not "the
+    // reverse announcement" - Espryt's half of that moved to the frontend-keyed scope with the
+    // rest of the registry debt - it is MAGMA'S FOUR APPLY-THREAD ALLOCATOR TOUCHES, which P7
+    // retires (VulkanRenderer.cpp's two hidden-resource shutdowns and its named-blit endpoint
+    // resolve, plus MGPipeAnnounceBufferGpuWritten in ResourceTracker.h). Naming the scope
+    // after the debt rather than after one of its sites is what makes "has P7 landed yet" a
+    // grep; naming it after Magma is what stops a new Espryt site being wrapped in it.
+    //
+    // THE EXEMPTION IS REFUSED WHEN THE SERVER BACKEND IS NOT DirectVulkan, and that is the
+    // point of the key rather than a safety belt. Magma stays lockstep for the whole of P5e
+    // (§6.1: the DirectVulkan arm never publishes kCapRunAheadApply, so every record there is
+    // barriered and every probe inside this scope keeps P5C's semantics). Espryt is what P5e
+    // is retiring the lockstep for, so an Espryt probe must not be able to borrow Magma's
+    // exemption - even by wrapping itself in Magma's scope.
+    class MagmaP7AllocatorDebtScope {
+    public:
+        MagmaP7AllocatorDebtScope();
+        ~MagmaP7AllocatorDebtScope();
+        MagmaP7AllocatorDebtScope(const MagmaP7AllocatorDebtScope&) = delete;
+        MagmaP7AllocatorDebtScope& operator=(const MagmaP7AllocatorDebtScope&) = delete;
+        static Bool ActiveOnApplyThread();
+
+    private:
+        Bool m_counted;
+    };
+
+    // The SECOND named exemption family (CONTRACT-P5C §5.4): the frontend-keyed twin
+    // registry (audit row G6). The texture / sampler-view / FBO-legacy HandleOf probes are
+    // how the server answers "which twin is this frontend object" while the registry is
+    // keyed by frontend identity - server-PRIVATE state whose rekey onto handles is
+    // P5e's per-family packages', not P5c's. A probe inside this scope stays a read-only,
+    // BARRIER-HELD debt - and P5e (id) makes the "barrier-held" half literal rather than
+    // documentary: the exemption now holds only while MGPipeApplierCurrentRecordIsBarriered()
+    // (§4.4), i.e. only while the client is actually parked behind the record being applied.
+    // Wrapping a NEW site in it is the greppable act of naming that debt, and an unwrapped
+    // probe from the apply thread is still Fatal{RoleViolation, "MGPipeSlots"}.
+    //
+    // WHAT THE CLASS IS FOR NOW, since P5e deletes most of its sites: vi/sb/pg/tx2/fb delete
+    // their ~20 draw-path constructions with the probes they wrap, and what survives is the
+    // set of BARRIERED-ROW sites (CONTRACT-P5E §4.4: DirectGLES.cpp's CopyTex / GetTexImage /
+    // mipmap-shape / set_storage_block_binding / detach-walk sites, the two verify arms, and -
+    // until vi/sb carry the handle - BufferImpl::HandleOfBuffer). Those keep P5C's semantics
+    // because their records are barriered and their client IS parked.
+    //
+    // Apply-thread-only depth, and m_counted, for MagmaP7AllocatorDebtScope's reasons
+    // above. This is the scope that pays: it is constructed at ~20 sites in DirectGLES.cpp,
+    // several of them inside StateBackendObjectRegistry::HandleOf on the per-draw path, and
+    // its ctor/dtor alone were 18.75% + 13.95% of the monolith GL thread's emutls samples.
+    class MGPipeFrontendKeyedRegistryScope {
+    public:
+        MGPipeFrontendKeyedRegistryScope();
+        ~MGPipeFrontendKeyedRegistryScope();
+        MGPipeFrontendKeyedRegistryScope(const MGPipeFrontendKeyedRegistryScope&) = delete;
+        MGPipeFrontendKeyedRegistryScope& operator=(const MGPipeFrontendKeyedRegistryScope&) = delete;
+        static Bool ActiveOnApplyThread();
+
+    private:
+        Bool m_counted;
+    };
+#endif
+} // namespace MobileGL::MG_Pipe

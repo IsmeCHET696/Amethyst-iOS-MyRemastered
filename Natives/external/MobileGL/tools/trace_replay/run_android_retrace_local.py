@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -119,7 +120,7 @@ def render_summary():
     shutil.copyfile(SUMMARY_DIR / SUMMARY_HTML, SUMMARY_DIR / "index.html")
 
 
-def run_case(case, backend, extra_args=None, timeout_seconds=None):
+def run_case(case, backend, extra_args=None, timeout_seconds=None, env_overrides=None):
     backend_info = BACKENDS[backend]
     apk = find_trace_apk()
     trace_archive = FIXTURES / case["trace_archive"]
@@ -189,6 +190,11 @@ def run_case(case, backend, extra_args=None, timeout_seconds=None):
         command.append("--avoid-angle-llvmpipe-explicit-lod-bias")
     if case.get("coherent_as_flush"):
         command.append("--coherent-as-flush")
+    # Generic environment passthrough: --env MOBILEGL_FOO=1 needs no per-knob plumbing in
+    # this script, in trace-replay-ci.sh, in the Activity, in the JNI marshalling or in the
+    # runner - one extra carries them all.
+    if env_overrides:
+        command.extend(["--env", ";".join(env_overrides)])
     env = dict(**__import__("os").environ)
     env["PYTHON"] = "python"
     env["MSYS2_ARG_CONV_EXCL"] = "/data/*"
@@ -220,8 +226,63 @@ def read_benchmark(case, backend, run_index):
     return report
 
 
+def series_median(values):
+    """The median, by the rule SummarizeSeries uses on the device.
+
+    trace_replay_core.cpp's SeriesSummary takes the middle element of an odd window and the
+    AVERAGE of the two middle elements of an even one, so p50 has to be computed the same way or
+    the line would print a p50 next to a medianFrameCpuMs that disagreed with it for a reason
+    nobody could see. (It is the only one of the three that is not a nearest rank: the device's
+    p95 is.)
+    """
+    if not values:
+        return -1.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def nearest_rank_percentile(values, fraction):
+    """Nearest-rank percentile, the rule SummarizeSeries uses on the device for p95.
+
+    Nearest rank rather than an interpolating percentile so that every number printed here is a
+    frame that was actually observed, and so that a p95 computed on this side agrees exactly with
+    the p95 the device reported for the same window. The device computes no p99 at all - that is
+    the whole reason benchmark.json carries the full series - so p99 is this rule extended, and
+    p50 is NOT computed here (see series_median).
+    """
+    if not values:
+        return -1.0
+    ordered = sorted(values)
+    rank = math.ceil(fraction * len(ordered))
+    if rank < 1:
+        rank = 1
+    return ordered[rank - 1]
+
+
+def cpu_tail(report):
+    """The trailing window of the per-frame CPU series, or [] when the run collected none.
+
+    benchmark.json carries the WHOLE frameCpuTimesMs[] array precisely so that p99 - which the
+    device does not compute, and which the paired A/B publishes beside p50 - is a host-side
+    reduction over an artefact that already exists. The window is the same trailing tailFrames the
+    device summarised, so the numbers below sit beside the device's own without being about a
+    different set of frames; p50 is recomputed here by the device's own median rule, so it agrees
+    with medianFrameCpuMs on the same run rather than merely sitting next to it.
+    """
+    series = report.get("frameCpuTimesMs") or []
+    if not series:
+        return []
+    tail = report.get("tailFrames", 0)
+    if not isinstance(tail, int) or tail <= 0 or tail > len(series):
+        tail = len(series)
+    return series[-tail:]
+
+
 def format_benchmark(report):
-    return (
+    line = (
         f"frames={report.get('totalFrames', -1)}"
         f" total={report.get('totalSeconds', -1):.1f}s"
         f" tail={report.get('tailFrames', -1)}"
@@ -230,6 +291,22 @@ def format_benchmark(report):
         f" p95={report.get('p95FrameMs', -1):.3f}ms"
         f" fps={report.get('fps', -1):.1f}"
     )
+    # The CPU half. It is what the disaggregation A/B is actually read on - wall time under
+    # --benchmark-no-finish still contains everything the retrace thread waited for - so it is
+    # printed on the same line rather than left to whoever remembers to open the JSON.
+    window = cpu_tail(report)
+    if window:
+        line += (
+            f" | cpu mean={report.get('meanFrameCpuMs', -1):.3f}ms"
+            f" p50={series_median(window):.3f}ms"
+            f" p95={report.get('p95FrameCpuMs', -1):.3f}ms"
+            f" p99={nearest_rank_percentile(window, 0.99):.3f}ms"
+        )
+    else:
+        # Not "cpu=0": a run with no per-thread CPU clock and a run that burned no CPU are
+        # different claims, and only one of them is possible.
+        line += " | cpu unavailable (no per-thread CPU clock in this run)"
+    return line
 
 
 def run_benchmark_case(case, backend, args):
@@ -255,7 +332,13 @@ def run_benchmark_case(case, backend, args):
         stale = RESULT_ROOT / f"{safe_case(case['name'])}-{backend}" / "benchmark.json"
         if stale.exists():
             stale.unlink()
-        rc = run_case(case, backend, extra_args=extra_args, timeout_seconds=args.benchmark_timeout_seconds)
+        rc = run_case(
+            case,
+            backend,
+            extra_args=extra_args,
+            timeout_seconds=args.benchmark_timeout_seconds,
+            env_overrides=args.env,
+        )
         report = read_benchmark(case, backend, run_index)
         if rc != 0 or report is None:
             print(f"{label} run {run_index}/{args.benchmark_repeats}: FAILED (exit {rc})", flush=True)
@@ -287,6 +370,15 @@ def parse_args():
     parser.add_argument("--backend", action="append", choices=sorted(BACKENDS), help="Backend to run; may be repeated.")
     parser.add_argument("--all", action="store_true", help="Run every case in the APK workflow matrix.")
     parser.add_argument("--keep-results", action="store_true", help="Do not clear the previous result root.")
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Environment variable to set in the replay process, applied just before "
+             "libMobileGL.so is loaded; may be repeated. A KEY with no '=' unsets it. This "
+             "is the generic passthrough for MOBILEGL_* knobs that have no flag of their own.",
+    )
     parser.add_argument(
         "--benchmark",
         action="store_true",
@@ -343,7 +435,7 @@ def main():
                 failures += run_benchmark_case(case, backend, args)
                 continue
             print(f"=== Android retrace: {case['name']} / {backend} ===", flush=True)
-            rc = run_case(case, backend)
+            rc = run_case(case, backend, env_overrides=args.env)
             try:
                 render_summary()
             except Exception as error:

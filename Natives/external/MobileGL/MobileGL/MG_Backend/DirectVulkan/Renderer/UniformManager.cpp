@@ -10,6 +10,11 @@
 
 #include "MG_Backend/DirectVulkan/DirectVulkanResourceState.h"
 #include "MG_State/GLState/Core.h"
+#include <MG_Pipe/PipeInputsSwitch.h>
+#if MOBILEGL_PIPE_PUSH
+// P5c ev: the GPU-write announcement routes through the reverse channel (R2).
+#include <MG_Impl/Pipe/ResourceTracker.h>
+#endif
 #include "MG_State/GLState/ProgramState/ProgramObject.h"
 #include "MG_State/GLState/TextureState/TextureObject1D.h"
 #include "MG_State/GLState/TextureState/TextureObject2D.h"
@@ -20,6 +25,7 @@
 #include "MG_Util/Converters/GLToMG/TextureEnumConverter.h"
 #include "MG_Util/Converters/MGToStr/FramebufferEnumConverter.h"
 #include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
+#include "MG_Util/Metrics/PipeStats.h"
 #include "MG_Util/Metrics/TextureMetrics.h"
 #include "MG_Util/ShaderTranspiler/Types.h"
 #include <Config.h>
@@ -502,7 +508,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // alive through the draw via GL binding state. Only the fallback path needs a SharedPtr to
         // keep the fallback texture alive for the rest of this call.
         MG_State::GLState::ITextureObject* texture = ResolveSamplerTextureRaw(program, programObj, binding, element);
-        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
+        auto& textureUnit = MGB_CTX->GetTextureUnitObject(unit);
         const auto& samplerOverride = textureUnit.GetSamplerObject();
         const auto preferredTarget = programObj.samplerTextureTargetByBinding[binding];
         SharedPtr<MG_State::GLState::ITextureObject> fallbackHolder;
@@ -551,7 +557,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return false;
         }
         if (!IsValidSampledImageLayout(resource->layout)) {
-            auto drawFbo = MG_State::pGLContext->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+            auto drawFbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
             FramebufferAttachmentType attachmentType = FramebufferAttachmentType::None;
             Int attachmentLevel = 0;
             if (drawFbo &&
@@ -778,7 +784,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 // filtering - which a single-level view can still have. Resolve the sampler exactly
                 // the way ResolveSamplerDescriptor does and bail if anisotropy would apply.
                 const Int unit = ResolveSamplerUnitIndex(program, location, binding);
-                const auto& samplerOverride = MG_State::pGLContext->GetTextureUnitObject(unit).GetSamplerObject();
+                const auto& samplerOverride = MGB_CTX->GetTextureUnitObject(unit).GetSamplerObject();
                 const auto* effectiveSampler =
                     samplerOverride ? samplerOverride.get() : texture->GetSamplerObject().get();
                 if (effectiveSampler == nullptr) return false;
@@ -808,7 +814,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                          const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
                                                          SharedPtr<MG_State::GLState::ITextureObject>& outTexture) {
         outTexture.reset();
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveSamplerTexture: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveSamplerTexture: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
                         "ResolveSamplerTexture: sampler location binding %u out of range", binding);
         MOBILEGL_ASSERT(binding < programObj.samplerTextureTargetByBinding.size(),
@@ -817,7 +823,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const Int location = programObj.samplerUniformLocationByBinding[binding];
         const Int unit = ResolveSamplerUnitIndex(program, location, binding);
 
-        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
+        auto& textureUnit = MGB_CTX->GetTextureUnitObject(unit);
         const TextureTarget preferredTarget = programObj.samplerTextureTargetByBinding[binding];
         outTexture = textureUnit.GetBindingSlot(preferredTarget).GetBoundObject();
         // The slot always holds at least the target's default texture (name 0). While that
@@ -833,7 +839,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     MG_State::GLState::ITextureObject* UniformManager::ResolveSamplerTextureRaw(
         const MG_State::GLState::ProgramObject& program, const ProgramFactory::VkProgramObject& programObj,
         Uint32 binding, Uint32 element) {
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveSamplerTextureRaw: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveSamplerTextureRaw: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
                         "ResolveSamplerTextureRaw: sampler location binding %u out of range", binding);
         MOBILEGL_ASSERT(binding < programObj.samplerTextureTargetByBinding.size(),
@@ -843,7 +849,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             ResolveDescriptorElementLocation(program, programObj.samplerUniformLocationByBinding[binding], element);
         const Int unit = ResolveSamplerUnitIndex(program, location, binding);
 
-        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
+        auto& textureUnit = MGB_CTX->GetTextureUnitObject(unit);
         const TextureTarget preferredTarget = programObj.samplerTextureTargetByBinding[binding];
         // GetBoundObject() returns the SharedPtr by const ref; .get() reads the pointer without
         // touching the refcount (no atomic inc/dec per binding per draw).
@@ -988,7 +994,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                              VkBufferView& outBufferView) {
         outBufferView = VK_NULL_HANDLE;
         MOBILEGL_ASSERT(m_bufferManager != nullptr, "ResolveStorageTexelBufferDescriptor: buffer manager is null");
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveStorageTexelBufferDescriptor: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveStorageTexelBufferDescriptor: GL context is null");
         MOBILEGL_ASSERT(frameIndex < m_frames.size(),
                         "ResolveStorageTexelBufferDescriptor: frame index out of range");
         MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
@@ -1012,7 +1018,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(binding < programObj.samplerNumericDomainByBinding.size(),
                         "ResolveStorageTexelBufferDescriptor: numeric domain binding %u out of range", binding);
 
-        auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(imageUnit);
+        auto& imageBinding = MGB_CTX->GetImageTextureBinding(imageUnit);
         const auto& texture = imageBinding.Texture;
         if (texture == nullptr) {
             // An image unit with no texture on it is legal GL (4.6 core 8.26): loads return zero
@@ -1070,7 +1076,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // changed a byte of it.
         bufferObject->EnsureGpuResidentStorage();
         if (imageBinding.Access != GL_READ_ONLY) {
+#if MOBILEGL_PIPE_PUSH
+            // P5c ev (R2, CONTRACT-P5C §4.2): the announcement goes through the reverse
+            // channel - the apply thread may not poke the client object directly.
+            MG_Pipe::MGPipeAnnounceBufferGpuWritten(bufferObject);
+#else
             bufferObject->MarkGpuWritten();
+#endif
         }
 
         BufferSlice slice{};
@@ -1148,7 +1160,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                         VkDescriptorBufferInfo& outBufferInfo) const {
         outBufferInfo = {};
         MOBILEGL_ASSERT(m_bufferManager != nullptr, "ResolveStorageBufferDescriptor: buffer manager is null");
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveStorageBufferDescriptor: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveStorageBufferDescriptor: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.storageBlockIndexByBinding.size(),
                         "ResolveStorageBufferDescriptor: binding %u out of range", binding);
 
@@ -1185,12 +1197,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 ? static_cast<GLuint>(atomicCounterBinding)
                 : GetShaderStorageBlockBinding(program, static_cast<GLuint>(blockIndex)) + element;
         const Uint32 bindingPointCount =
-            static_cast<Uint32>(MG_State::pGLContext->GetBufferBindingPointCount(bufferTarget));
+            static_cast<Uint32>(MGB_CTX->GetBufferBindingPointCount(bufferTarget));
         MOBILEGL_ASSERT(frontendBinding < bindingPointCount,
                         "ResolveStorageBufferDescriptor: frontend binding %u out of range for block '%s'",
                         frontendBinding, blockName.c_str());
 
-        auto& bindingPoint = MG_State::pGLContext->GetBufferBindingPoint(bufferTarget, frontendBinding);
+        auto& bindingPoint = MGB_CTX->GetBufferBindingPoint(bufferTarget, frontendBinding);
         const auto& bufferObject = bindingPoint.GetBoundObject();
         if (bufferObject == nullptr) {
             // NOT an error, and above all not a reason to lose the draw. GL 4.6 core 7.8 lets a
@@ -1226,7 +1238,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // results are visible without a readback path, exactly as for a capture buffer.
         bufferObject->EnsureGpuResidentStorage();
         // ... and the read that follows has to wait for this draw or dispatch to retire.
+#if MOBILEGL_PIPE_PUSH
+        // P5c ev (R2, CONTRACT-P5C §4.2): through the reverse channel, not a direct poke of
+        // the client object from the apply thread.
+        MG_Pipe::MGPipeAnnounceBufferGpuWritten(bufferObject);
+#else
         bufferObject->MarkGpuWritten();
+#endif
 
         BufferSlice slice{};
         if (!m_bufferManager->AcquireResidentSlice(BufferKind::ShaderStorage, bufferObject, slice) || !slice.IsValid()) {
@@ -1262,7 +1280,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                        VkDescriptorImageInfo& outImageInfo) const {
         outImageInfo = {};
         MOBILEGL_ASSERT(m_textureManager != nullptr, "ResolveStorageImageDescriptor: texture manager is null");
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveStorageImageDescriptor: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveStorageImageDescriptor: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
                         "ResolveStorageImageDescriptor: binding %u out of range", binding);
 
@@ -1291,7 +1309,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return false;
         }
 
-        auto& imageBinding = MG_State::pGLContext->GetImageTextureBinding(imageUnit);
+        auto& imageBinding = MGB_CTX->GetImageTextureBinding(imageUnit);
         if (imageBinding.Texture == nullptr) {
             // Legal GL: an image unit with no texture bound makes loads return zero and discards
             // stores (4.6 core 8.26). It is not a reason to lose the draw, which is what returning
@@ -1647,7 +1665,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // Open-coded ResolveSamplerTextureRaw so the unit is resolved once for both the
         // texture and the sampler override - this runs per binding per full-path draw,
         // and program-alternating draw streams take the full path on every draw.
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveSampledBinding: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveSampledBinding: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
                         "ResolveSampledBinding: sampler location binding %u out of range", binding);
         MOBILEGL_ASSERT(binding < programObj.samplerTextureTargetByBinding.size(),
@@ -1658,7 +1676,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return false;
         }
         const Int unit = ResolveSamplerUnitIndex(program, location, binding);
-        auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
+        auto& textureUnit = MGB_CTX->GetTextureUnitObject(unit);
         const TextureTarget preferredTarget = programObj.samplerTextureTargetByBinding[binding];
         MG_State::GLState::ITextureObject* texture =
             textureUnit.GetBindingSlot(preferredTarget).GetBoundObject().get();
@@ -1802,7 +1820,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const ProgramFactory::VkProgramObject& programObj,
         Vector<MG_State::GLState::ITextureObject*>& outTextures) const {
         outTextures.clear();
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr,
+        MOBILEGL_ASSERT(MGB_CTX_LIVE,
                         "CollectStorageImageTextures: GL context is null");
         // Same as the sampled walk: a declined program is refused at bind time, and its declined
         // binding has no uniform location to reach an image unit through.
@@ -1846,7 +1864,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                     return false;
                 }
 
-                auto* texture = MG_State::pGLContext->GetImageTextureBinding(imageUnit).Texture.get();
+                auto* texture = MGB_CTX->GetImageTextureBinding(imageUnit).Texture.get();
                 if (texture == nullptr) {
                     // ResolveStorageImageDescriptor will substitute the placeholder image for this
                     // binding; include it here for the same reason the sampled walk includes the
@@ -1884,7 +1902,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const ProgramFactory::VkProgramObject& programObj,
         Vector<SamplerImageFeedbackBinding>& outBindings) const {
         outBindings.clear();
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr,
+        MOBILEGL_ASSERT(MGB_CTX_LIVE,
                         "CollectSamplerImageFeedback: GL context is null");
         if (programObj.declinedDescriptors) return true;
 
@@ -1934,7 +1952,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                         if (imageUnit < 0 || imageUnit >= MG_State::GLState::TextureState::MAX_TEXTURE_IMAGE_UNITS) {
                             return false;
                         }
-                        const auto& image = MG_State::pGLContext->GetImageTextureBinding(imageUnit);
+                        const auto& image = MGB_CTX->GetImageTextureBinding(imageUnit);
                         // A sampler view exposes all layers of its target; equal texture plus an
                         // overlapping mip therefore aliases the writable image subresource.
                         if (image.Texture.get() == sampledTexture &&
@@ -1964,7 +1982,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const void* outData = nullptr;
         VkDeviceSize outSize = 0;
 
-        MOBILEGL_ASSERT(MG_State::pGLContext != nullptr, "ResolveUniformBufferPayload: GL context is null");
+        MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveUniformBufferPayload: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.bindingKinds.size(),
                         "ResolveUniformBufferPayload: binding %u out of range", binding);
         MOBILEGL_ASSERT(programObj.bindingKinds[binding] == ProgramFactory::DescriptorBindingKind::UniformBufferDynamic,
@@ -2009,12 +2027,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         const Uint32 frontendBinding = program.GetUniformBlockBinding(static_cast<Uint32>(blockIndex));
         const Uint32 uniformBindingPointCount =
-            static_cast<Uint32>(MG_State::pGLContext->GetBufferBindingPointCount(BufferTarget::Uniform));
+            static_cast<Uint32>(MGB_CTX->GetBufferBindingPointCount(BufferTarget::Uniform));
         MOBILEGL_ASSERT(frontendBinding < uniformBindingPointCount,
                         "ResolveUniformBufferPayload: frontend UBO binding %u out of range for block '%s'",
                         frontendBinding, program.GetUniformBlockName(static_cast<Uint32>(blockIndex)).c_str());
 
-        auto& bindingPoint = MG_State::pGLContext->GetBufferBindingPoint(BufferTarget::Uniform, frontendBinding);
+        auto& bindingPoint = MGB_CTX->GetBufferBindingPoint(BufferTarget::Uniform, frontendBinding);
         const auto& bufferObject = bindingPoint.GetBoundObject();
         MOBILEGL_ASSERT(bufferObject != nullptr,
                         "ResolveUniformBufferPayload: no UBO bound at frontend binding %u for block '%s'",
@@ -2075,6 +2093,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 out.range = blockSize;
                 out.dynamicOffset = rangeStart;
             }
+        }
+        if (MG_Util::PipeStats::Enabled() && !out.directBindable) {
+            // D-B8: the bytes Magma repacks into its own UBO ring, i.e. exactly the host
+            // payload a split build would have to ship with set_shader_buffers. Espryt binds
+            // the frontend buffer to the driver and contributes nothing here, which is why
+            // the class is named for the payload and not for the call. Counted AFTER the
+            // zero-copy direct-bind decision: a direct bind repacks nothing, and counting it
+            // here reported a copy that never happened.
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageUboNamed,
+                                         static_cast<Uint64>(outSize));
         }
         return true;
     }
@@ -2283,6 +2311,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         outBuffer = slice.buffer;
         outRange = ubo.payloadSize;
         outDynamicOffset = static_cast<Uint32>(slice.offset);
+        if (isGlobalUbo && MG_Util::PipeStats::Enabled()) {
+            // Magma's half of stage-ubo-global, so the class means the same on both
+            // backends. The memo hit above returns before this, so a frame that reuses the
+            // slice correctly contributes nothing.
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageUboGlobal,
+                                         static_cast<Uint64>(ubo.payloadSize));
+        }
         if (isGlobalUbo) {
             m_globalUboMemo[m_globalUboMemoNext] =
                 GlobalUboSliceMemo{uboProgramLifetimeId, uboFrameSerial, uboContentVersion,

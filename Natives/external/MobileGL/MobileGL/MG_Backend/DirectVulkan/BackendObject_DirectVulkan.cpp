@@ -12,6 +12,7 @@
 #include "SubgroupSupportPolicy.h"
 #include "MG_State/GLState/FramebufferState/FramebufferObject.h"
 #include "MG_State/GLState/Core.h"
+#include <MG_Pipe/PipeInputsSwitch.h>
 #include "MG_State/GLState/TextureState/TextureState.h"
 #include "MG_Util/Classifiers/TextureEnumClassifier.h"
 #include "MG_Util/Converters/MGToGL/TextureEnumConverter.h"
@@ -385,8 +386,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
         UpdateDynamicBackendParameters();
         UpdateAdvertisedExtensions();
-        if (MG_State::pGLContext) {
-            MG_State::pGLContext->InvalidateCompileEnv();
+        if (MGB_CTX_LIVE) {
+            MGB_CTX->InvalidateCompileEnv();
         }
         PopulateFormatCapabilities(physicalDevice.handle, vkGetPhysicalDeviceFormatProperties, m_vulkanCaps,
                                    MutableFormatCapabilities());
@@ -740,8 +741,6 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             funcsTable.GL.MemoryBarrierByRegion = MemoryBarrierByRegion;
             funcsTable.GL.BindImageTexture = BindImageTexture;
             funcsTable.GL.GetIntegeri_v = GetIntegeri_v;
-            funcsTable.GL.GetInteger64i_v = GetInteger64i_v;
-            funcsTable.GL.GetProgramiv = GetProgramiv;
             funcsTable.GL.ShaderStorageBlockBinding = ShaderStorageBlockBinding;
             funcsTable.GL.FenceSync = FenceSync;
             funcsTable.GL.ClientWaitSync = ClientWaitSync;
@@ -785,8 +784,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_vulkanCaps = capabilities;
         UpdateDynamicBackendParameters();
         UpdateAdvertisedExtensions();
-        if (MG_State::pGLContext) {
-            MG_State::pGLContext->InvalidateCompileEnv();
+        if (MGB_CTX_LIVE) {
+            MGB_CTX->InvalidateCompileEnv();
         }
         MutableFormatCapabilities().Clear();
     }
@@ -939,6 +938,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             clampLimit("GL_MAX_COMPUTE_UNIFORM_BLOCKS", m_vulkanCaps.MaxComputeUniformBlocks,
                        kMaxAdvertisedBufferBlocks);
         m_dynamicParameters.MaxComputeWorkGroupInvocations = m_vulkanCaps.MaxComputeWorkGroupInvocations;
+        // The six per-axis compute limits, from the same VkPhysicalDeviceLimits fields
+        // GLFunctionsTable::GetIntegeri_v (DirectVulkan.cpp) reads live. Carried here so that
+        // MGPCaps has them once the table entry retires (plan B section 4.4.1); GL_Getter floors
+        // them. Not clamped: unlike the block counts these are not amounts an application
+        // allocates, and the frontend already raises them to the GL minimum.
+        for (SizeT axis = 0; axis < 3; ++axis) {
+            m_dynamicParameters.MaxComputeWorkGroupCount[axis] = m_vulkanCaps.MaxComputeWorkGroupCount[axis];
+            m_dynamicParameters.MaxComputeWorkGroupSize[axis] = m_vulkanCaps.MaxComputeWorkGroupSize[axis];
+        }
         m_dynamicParameters.MaxShaderStorageBufferBindings =
             clampLimit("GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS", m_vulkanCaps.MaxShaderStorageBufferBindings,
                        kMaxAdvertisedBufferBlocks);

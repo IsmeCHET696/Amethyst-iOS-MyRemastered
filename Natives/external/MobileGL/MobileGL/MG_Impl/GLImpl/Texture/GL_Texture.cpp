@@ -30,6 +30,15 @@
 #include <MG_Impl/GLImpl/Sampler/Validators.h>
 #include <MG_Util/Math/FixedPointConversion.h>
 #include <MG_State/GLState/TextureState/TextureObjectBuffer.h>
+#include <MG_Impl/Pipe/PipeFill.h>
+// CONTRACT-P5.md §7 / ID-14: a null check on a GLFunctionsTable slot may not survive into the
+// client under split - it becomes a caps-mirror read. SlotCaps.h carries the rule and the test
+// that decides which of its two spellings a site takes; in a pull build both expand to exactly
+// the check they replaced.
+#include <MG_Remote/Client/SlotCaps.h>
+// P4a, ID-18 M2. The ONE door MG_State and MG_Impl have into the client's emitters; the three
+// call sites below are declarations only, exactly as the frontend's mutators are.
+#include <MG_Pipe/PipeMutation.h>
 
 namespace MobileGL::MG_Impl::GLImpl {
     static SharedPtr<MG_State::GLState::ITextureObject> nullTextureObject;
@@ -1076,6 +1085,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             Vector<Uint8> scratch(static_cast<SizeT>(width) * static_cast<SizeT>(height) * bytesPerTexel);
             {
                 ScopedNeutralPackState neutralPack;
+                MGP_FILL(ReadPixels);
                 MG_Backend::gBackendFunctionsTable.GL.ReadPixels(x, y, width, height, format, type, scratch.data());
             }
 
@@ -1335,6 +1345,30 @@ namespace MobileGL::MG_Impl::GLImpl {
                     std::format("pname {} is not a valid texture parameter.", MG_Util::ConvertGLEnumToString(pname))));
             return;
         }
+#if MOBILEGL_PIPE_PUSH
+        // P4a, ID-18 M2 - THE THIRTEENTH MGP_NOTE_AGGREGATE(TextureParams) SITE, and the one
+        // no publisher reached. Nine of the thirteen are TextureObject.cpp's own mutators and
+        // publish through TextureObjectBase::PipePublishParams; the tenth is
+        // SetDepthStencilTextureMode; two more move fields MGPTextureParams does not carry. The
+        // last is SamplerObject::BumpVersion, whose own comment calls it "the one choke point
+        // every setter reaches" - and MGPTextureParams takes MinLod, MaxLod and LodBias off that
+        // object, so every glTexParameter that writes GL_TEXTURE_MIN_LOD / MAX_LOD / LOD_BIAS
+        // landed on state nothing watched and the applier's record kept saying MinLod = 0.
+        // Wrong pixels, not a lost optimisation.
+        //
+        // THE HOOK IS HERE RATHER THAN ON BumpVersion because MG_State/GLState/SamplerState is
+        // package C's after the tag; C.7 grants this file for exactly this class of path ("the
+        // grant is one call site per path"), and this switch IS the path - every arm of it
+        // either writes the built-in SamplerObject or writes a texture field that publishes for
+        // itself. Placed after the switch, so the error arms above return without emitting.
+        //
+        // IT IS ALSO ID-14's RE-EMIT HOOK. C's sampler CSO cache is content-addressed, so the
+        // handle MGPTextureParams::BuiltinSampler names MOVES WITH THE CONTENT; the emitter
+        // re-Acquires from the cache and releases the previous handle here. An over-call is
+        // free: the emitter's version-first skip reads GetTextureParamsVersion() AND
+        // SamplerObject::GetVersion() and returns without hashing anything when neither moved.
+        MobileGL::MG_Pipe::MGPipeEmitTextureParams(*textureObject);
+#endif
     }
 
     void TextureParameterObjectf_State(const SharedPtr<MG_State::GLState::ITextureObject>& textureObject, GLenum pname,
@@ -1413,6 +1447,30 @@ namespace MobileGL::MG_Impl::GLImpl {
                     std::format("pname {} is not a valid texture parameter.", MG_Util::ConvertGLEnumToString(pname))));
             return;
         }
+#if MOBILEGL_PIPE_PUSH
+        // P4a, ID-18 M2 - THE THIRTEENTH MGP_NOTE_AGGREGATE(TextureParams) SITE, and the one
+        // no publisher reached. Nine of the thirteen are TextureObject.cpp's own mutators and
+        // publish through TextureObjectBase::PipePublishParams; the tenth is
+        // SetDepthStencilTextureMode; two more move fields MGPTextureParams does not carry. The
+        // last is SamplerObject::BumpVersion, whose own comment calls it "the one choke point
+        // every setter reaches" - and MGPTextureParams takes MinLod, MaxLod and LodBias off that
+        // object, so every glTexParameter that writes GL_TEXTURE_MIN_LOD / MAX_LOD / LOD_BIAS
+        // landed on state nothing watched and the applier's record kept saying MinLod = 0.
+        // Wrong pixels, not a lost optimisation.
+        //
+        // THE HOOK IS HERE RATHER THAN ON BumpVersion because MG_State/GLState/SamplerState is
+        // package C's after the tag; C.7 grants this file for exactly this class of path ("the
+        // grant is one call site per path"), and this switch IS the path - every arm of it
+        // either writes the built-in SamplerObject or writes a texture field that publishes for
+        // itself. Placed after the switch, so the error arms above return without emitting.
+        //
+        // IT IS ALSO ID-14's RE-EMIT HOOK. C's sampler CSO cache is content-addressed, so the
+        // handle MGPTextureParams::BuiltinSampler names MOVES WITH THE CONTENT; the emitter
+        // re-Acquires from the cache and releases the previous handle here. An over-call is
+        // free: the emitter's version-first skip reads GetTextureParamsVersion() AND
+        // SamplerObject::GetVersion() and returns without hashing anything when neither moved.
+        MobileGL::MG_Pipe::MGPipeEmitTextureParams(*textureObject);
+#endif
     }
 
     void GetTextureParameterObjectiv_State(const SharedPtr<MG_State::GLState::ITextureObject>& textureObject,
@@ -1619,6 +1677,7 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void GenerateMipmap_Backend(GLenum target) {
+        MGP_FILL(GenerateMipmap);
         MG_Backend::gBackendFunctionsTable.GL.GenerateMipmap(target);
     }
 
@@ -2102,6 +2161,30 @@ namespace MobileGL::MG_Impl::GLImpl {
                     std::format("pname {} is not a valid texture parameter.", MG_Util::ConvertGLEnumToString(pname))));
             return;
         }
+#if MOBILEGL_PIPE_PUSH
+        // P4a, ID-18 M2 - THE THIRTEENTH MGP_NOTE_AGGREGATE(TextureParams) SITE, and the one
+        // no publisher reached. Nine of the thirteen are TextureObject.cpp's own mutators and
+        // publish through TextureObjectBase::PipePublishParams; the tenth is
+        // SetDepthStencilTextureMode; two more move fields MGPTextureParams does not carry. The
+        // last is SamplerObject::BumpVersion, whose own comment calls it "the one choke point
+        // every setter reaches" - and MGPTextureParams takes MinLod, MaxLod and LodBias off that
+        // object, so every glTexParameter that writes GL_TEXTURE_MIN_LOD / MAX_LOD / LOD_BIAS
+        // landed on state nothing watched and the applier's record kept saying MinLod = 0.
+        // Wrong pixels, not a lost optimisation.
+        //
+        // THE HOOK IS HERE RATHER THAN ON BumpVersion because MG_State/GLState/SamplerState is
+        // package C's after the tag; C.7 grants this file for exactly this class of path ("the
+        // grant is one call site per path"), and this switch IS the path - every arm of it
+        // either writes the built-in SamplerObject or writes a texture field that publishes for
+        // itself. Placed after the switch, so the error arms above return without emitting.
+        //
+        // IT IS ALSO ID-14's RE-EMIT HOOK. C's sampler CSO cache is content-addressed, so the
+        // handle MGPTextureParams::BuiltinSampler names MOVES WITH THE CONTENT; the emitter
+        // re-Acquires from the cache and releases the previous handle here. An over-call is
+        // free: the emitter's version-first skip reads GetTextureParamsVersion() AND
+        // SamplerObject::GetVersion() and returns without hashing anything when neither moved.
+        MobileGL::MG_Pipe::MGPipeEmitTextureParams(*textureObject);
+#endif
     }
 
     void TexParameteri_State(GLenum target, GLenum pname, GLint param) {
@@ -4024,6 +4107,7 @@ namespace MobileGL::MG_Impl::GLImpl {
 
     void CopyTexSubImage2D_Backend(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y,
                                    GLsizei width, GLsizei height) {
+        MGP_FILL(CopyTexSubImage2D);
         MG_Backend::gBackendFunctionsTable.GL.CopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
     }
 
@@ -4040,6 +4124,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                                              "Backend does not support image-to-image copies."));
             return;
         }
+        MGP_FILL(CopyImageSubData);
         copyImageSubData(src, srcTarget, srcLevel, srcX, srcY, srcZ, dst, dstTarget, dstLevel, dstX,
                          dstY, dstZ, srcWidth, srcHeight, srcDepth);
     }
@@ -4461,6 +4546,7 @@ namespace MobileGL::MG_Impl::GLImpl {
 
     void CopyTexImage2D_Backend(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width,
                                 GLsizei height, GLint border) {
+        MGP_FILL(CopyTexImage2D);
         MG_Backend::gBackendFunctionsTable.GL.CopyTexImage2D(target, level, internalformat, x, y, width, height,
                                                              border);
     }
@@ -5071,6 +5157,7 @@ namespace MobileGL::MG_Impl::GLImpl {
     }
 
     void GetTexImage_Backend(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels) {
+        MGP_FILL(GetTexImage);
         MG_Backend::gBackendFunctionsTable.GL.GetTexImage(target, level, format, type, pixels);
     }
 
@@ -6452,7 +6539,8 @@ namespace MobileGL::MG_Impl::GLImpl {
                                                GLenum type, GLsizei bufSize, void* pixels, const char* caller) {
         if (MG_Backend::pActiveBackendObject != nullptr &&
             MG_Backend::pActiveBackendObject->GetBackendType() == BackendType::DirectVulkan &&
-            MG_Backend::gBackendFunctionsTable.GL.GetTextureImage != nullptr) {
+            MGL_BACKEND_SLOT_LOCAL(GetTextureImage)) {
+            MGP_FILL(GetTextureImage);
             MG_Backend::gBackendFunctionsTable.GL.GetTextureImage(textureObject, uploadTarget, level, format, type,
                                                                   bufSize, pixels);
             return;
@@ -6657,6 +6745,17 @@ namespace MobileGL::MG_Impl::GLImpl {
         MG_State::pGLContext->GetImageTextureBinding(static_cast<Int>(unit))
             .Bind(textureObject, level, layered, layer, access, format);
         MG_State::pGLContext->NoteTextureUnitTouched(static_cast<Int>(unit));
+#if MOBILEGL_PIPE_PUSH
+        // AND THE IMAGE-UNIT MARK BESIDE IT. The line above moves the TEXTURE-unit high-water
+        // mark, which is a different array: a reader that needs "the highest image unit ever
+        // bound" cannot take it from there without either over-walking (a texture bind at unit
+        // 31 with no image bound anywhere) or, worse, under-walking if that line ever moves. The
+        // split client's per-draw writable-image sweep is that reader
+        // (MG_Remote/Client/GpuWritePending.cpp). Push builds only, so the pull build's bytes do
+        // not move (G1).
+        MG_State::pGLContext->NoteImageUnitTouched(static_cast<Int>(unit));
+#endif
+        MGP_FILL(BindImageTexture);
         bindImageTexture(unit, texture, level, layered, layer, access, format);
     }
 
@@ -6712,7 +6811,7 @@ namespace MobileGL::MG_Impl::GLImpl {
 
     void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels) {
         if (!GetTexImage_State(target, level, format, type, pixels)) return;
-        if (MG_Backend::gBackendFunctionsTable.GL.GetTexImage != nullptr) {
+        if (MGL_BACKEND_SLOT_LOCAL(GetTexImage)) {
             GetTexImage_Backend(target, level, format, type, pixels);
             return;
         }

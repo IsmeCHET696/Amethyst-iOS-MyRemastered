@@ -6,6 +6,10 @@ on:
       - dev
       - Feat/Backend-Direct-GLES
       - Feat/Backend-Direct-Vulkan
+      # TEMPORARY, remove before merging the MGPipe work into dev: the disaggregation
+      # branch runs the full lane on every push so a phase's landing is not gated on
+      # someone remembering to dispatch the workflow by hand.
+      - feat/disaggregated
   workflow_dispatch:
 
 jobs:
@@ -61,6 +65,8 @@ jobs:
         uses: android-actions/setup-android@v4
         with:
           accept-android-sdk-licenses: false
+          packages: platform-tools
+          cmdline-tools-version: 13114758
 
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses >/dev/null
@@ -293,6 +299,8 @@ jobs:
         uses: android-actions/setup-android@v4
         with:
           accept-android-sdk-licenses: false
+          packages: platform-tools
+          cmdline-tools-version: 13114758
 
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses >/dev/null
@@ -368,6 +376,8 @@ jobs:
         uses: android-actions/setup-android@v4
         with:
           accept-android-sdk-licenses: false
+          packages: platform-tools
+          cmdline-tools-version: 13114758
 
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses >/dev/null

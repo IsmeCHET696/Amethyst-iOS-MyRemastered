@@ -11,6 +11,16 @@
 #include <MG_State/GLState/Core.h>
 #include <MG_State/EGLState/Core.h>
 #include <MG_Backend/BackendObjects.h>
+#include <MG_Impl/Pipe/PipeFill.h>
+#if MOBILEGL_BUILD_DISAGGREGATED
+#include <MG_Remote/Client/GpuWritePending.h>
+#endif
+// CONTRACT-P5.md §7 / ID-14: a null check on a GLFunctionsTable slot may not survive into the
+// client under split - it becomes a caps-mirror read. SlotCaps.h carries the rule and the test
+// that decides which of its two spellings a site takes; in a pull build both expand to exactly
+// the check they replaced. P5b t2 converts ONE site in this file - the capture-ownership probe
+// in FixupGsStripCaptureOrder - for the reason CONTRACT-P5B.md §6.5 gives.
+#include <MG_Remote/Client/SlotCaps.h>
 #include "../Getter/GL_Getter.h"
 
 namespace MobileGL::MG_Impl::GLImpl {
@@ -527,6 +537,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(Clear);
         MG_Backend::gBackendFunctionsTable.GL.Clear(mask);
     }
 
@@ -535,6 +546,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawElements);
         MG_Backend::gBackendFunctionsTable.GL.DrawElements(mode, count, type, indices);
     }
 
@@ -544,6 +556,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawElements);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawElements(mode, count, type, indices, drawcount);
     }
 
@@ -553,6 +566,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawElementsBaseVertex);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawElementsBaseVertex(mode, count, type, indices, drawcount,
                                                                           basevertex);
     }
@@ -562,6 +576,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawArrays);
         MG_Backend::gBackendFunctionsTable.GL.DrawArrays(mode, first, count);
     }
 
@@ -570,6 +585,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawArrays);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawArrays(mode, first, count, drawcount);
     }
 
@@ -579,6 +595,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawElementsBaseVertex);
         MG_Backend::gBackendFunctionsTable.GL.DrawElementsBaseVertex(mode, count, type, indices, basevertex);
     }
 
@@ -588,6 +605,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawElementsIndirect);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawElementsIndirect(mode, type, indirect, drawcount, stride);
     }
 
@@ -596,6 +614,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawArraysIndirect);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawArraysIndirect(mode, indirect, drawcount, stride);
     }
 
@@ -605,6 +624,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawElementsIndirectCount);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawElementsIndirectCount(mode, type, indirect, drawcount,
                                                                              maxdrawcount, stride);
     }
@@ -615,6 +635,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(MultiDrawArraysIndirectCount);
         MG_Backend::gBackendFunctionsTable.GL.MultiDrawArraysIndirectCount(mode, indirect, drawcount, maxdrawcount,
                                                                            stride);
     }
@@ -625,6 +646,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawRangeElementsBaseVertex);
         MG_Backend::gBackendFunctionsTable.GL.DrawRangeElementsBaseVertex(mode, start, end, count, type, indices,
                                                                           basevertex);
     }
@@ -635,6 +657,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawRangeElements);
         MG_Backend::gBackendFunctionsTable.GL.DrawRangeElements(mode, start, end, count, type, indices);
     }
 
@@ -645,6 +668,8 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_SET_BASE_INSTANCE(baseinstance);
+        MGP_FILL(DrawElementsInstancedBaseVertexBaseInstance);
         MG_Backend::gBackendFunctionsTable.GL.DrawElementsInstancedBaseVertexBaseInstance(
             mode, count, type, indices, instancecount, basevertex, baseinstance);
     }
@@ -655,6 +680,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawElementsInstancedBaseVertex);
         MG_Backend::gBackendFunctionsTable.GL.DrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount,
                                                                               basevertex);
     }
@@ -665,6 +691,8 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_SET_BASE_INSTANCE(baseinstance);
+        MGP_FILL(DrawElementsInstancedBaseInstance);
         MG_Backend::gBackendFunctionsTable.GL.DrawElementsInstancedBaseInstance(mode, count, type, indices,
                                                                                 instancecount, baseinstance);
     }
@@ -675,6 +703,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawElementsInstanced);
         MG_Backend::gBackendFunctionsTable.GL.DrawElementsInstanced(mode, count, type, indices, instancecount);
     }
 
@@ -683,6 +712,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawElementsIndirect);
         MG_Backend::gBackendFunctionsTable.GL.DrawElementsIndirect(mode, type, indirect);
     }
     void DrawArraysInstancedBaseInstance_Backend(GLenum mode, GLint first, GLsizei count, GLsizei instancecount,
@@ -691,6 +721,8 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_SET_BASE_INSTANCE(baseinstance);
+        MGP_FILL(DrawArraysInstancedBaseInstance);
         MG_Backend::gBackendFunctionsTable.GL.DrawArraysInstancedBaseInstance(mode, first, count, instancecount,
                                                                               baseinstance);
     }
@@ -700,6 +732,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawArraysInstanced);
         MG_Backend::gBackendFunctionsTable.GL.DrawArraysInstanced(mode, first, count, instancecount);
     }
 
@@ -708,6 +741,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         ZoneScopedC(TRACY_ZONECOLOR_BACKEND);
 #endif
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DrawArraysIndirect);
         MG_Backend::gBackendFunctionsTable.GL.DrawArraysIndirect(mode, indirect);
     }
 
@@ -739,6 +773,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         // GL 4.3 added both dispatches to the conditional-render set (GL 4.6 core 10.9), which is
         // exactly what KHR-GL43.compute_shader.conditional-dispatching checks.
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DispatchCompute);
         dispatchCompute(numGroupsX, numGroupsY, numGroupsZ);
     }
 
@@ -791,6 +826,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
         if (!ValidateCurrentProgramForCompute(__func__)) return;
         if (ConditionalRenderDiscardsCommand()) return;
+        MGP_FILL(DispatchComputeIndirect);
         dispatchComputeIndirect(indirect);
     }
 
@@ -812,6 +848,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
         MG_State::pGLContext->SetPatchVertices(static_cast<Uint>(value));
         if (const auto patchParameteri = MG_Backend::gBackendFunctionsTable.GL.PatchParameteri) {
+            MGP_FILL(PatchParameteri);
             patchParameteri(pname, value);
         }
     }
@@ -882,6 +919,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "Backend does not support memory barriers."));
             return;
         }
+        MGP_FILL(MemoryBarrier);
         memoryBarrier(barriers);
     }
 
@@ -903,6 +941,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                 MakeUnique<GenericErrorInfo>("MG_Impl/GLImpl", __func__, "Backend does not support memory barriers."));
             return;
         }
+        MGP_FILL(MemoryBarrier);
         memoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
     }
 
@@ -916,6 +955,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                                              "Backend does not support regional memory barriers."));
             return;
         }
+        MGP_FILL(MemoryBarrierByRegion);
         memoryBarrierByRegion(barriers);
     }
 
@@ -1238,6 +1278,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
         MG_State::pGLContext->BeginTransformFeedback(primitiveMode, program);
         if (const auto beginXfb = MG_Backend::gBackendFunctionsTable.GL.BeginTransformFeedback) {
+            MGP_FILL(BeginTransformFeedback);
             beginXfb(primitiveMode);
         }
     }
@@ -1252,7 +1293,15 @@ namespace MobileGL::MG_Impl::GLImpl {
         // Only Vulkan-order captures need this. A backend that runs the capture on its
         // own GL/ES driver (it owns the span, hence the EndTransformFeedback entry) has
         // already produced GL's vertex order, and reordering it again would corrupt it.
-        if (MG_Backend::gBackendFunctionsTable.GL.EndTransformFeedback != nullptr) {
+        //
+        // P5b t2 (CONTRACT-P5B.md §6.5): UNDER SPLIT THE TABLE THIS USED TO ASK IS THE CLIENT'S
+        // EMIT TABLE, whose EndTransformFeedback slot t2 just made non-null for every server -
+        // so the raw null check would answer "the backend owns the capture" even against Magma,
+        // which registers no XFB slot at all, and would skip a reorder Magma needs. The question
+        // is about the SERVER's table, so it is answered from the bit the server publishes.
+        // Under monolith (and in a pull build) this expands to the null check it replaced,
+        // character for character.
+        if (MGL_BACKEND_SLOT_CAP(EndTransformFeedback, MG_Pipe::kCapBackendOwnsXfbCapture)) {
             return;
         }
         if (program == nullptr || !program->HasGsTriangleStripCaptureFixup() || inputPrimitives == 0) {
@@ -1283,6 +1332,20 @@ namespace MobileGL::MG_Impl::GLImpl {
                                                             static_cast<Uint>(bufferIndex));
             const auto& buffer = bindingPoint.GetBoundObject();
             if (buffer == nullptr) continue;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // This fixup READS the captured bytes back through the shadow, so it is the one
+            // consumer that cannot simply inherit the deferral EndTransformFeedback's dropped
+            // fence introduces. Under split it pays the reconciliation itself, which is the
+            // same cost the fence used to charge every caller - here charged only to the
+            // capture shapes that actually need reordering.
+            //
+            // TRANSPORT-GATED LIKE EVERY OTHER NEW SITE (D-J). Without the test this fires in
+            // a build-split lane running MOBILEGL_TRANSPORT=monolith on Magma - whose
+            // BeginXfbCaptureForDraw does mark the capture targets - where the fence at the
+            // caller still runs, so the readback it emits is pure new work on the monolith
+            // path and integration-gpu cannot see it.
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) buffer->SyncGpuWrites();
+#endif
             const Range1D range = bindingPoint.GetRange();
             const Uint8* mapped = buffer->MappedData();
             if (mapped == nullptr) continue;
@@ -1320,17 +1383,37 @@ namespace MobileGL::MG_Impl::GLImpl {
         // Closed while the capture state is still active: a backend that captures
         // through its own driver reads the capture program and buffer bindings here.
         if (const auto endXfb = MG_Backend::gBackendFunctionsTable.GL.EndTransformFeedback) {
+            MGP_FILL(EndTransformFeedback);
             endXfb();
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5 (b1), the second producer the client-side GPU-write set ADDS, and it has to be
+        // taken HERE - before GLContext::EndTransformFeedback clears the live bindings, since
+        // a mark taken after it marks nothing.
+        MG_Remote::Client::MarkEndTransformFeedbackCaptureTargets();
+#endif
         MG_State::pGLContext->EndTransformFeedback();
         // Captured results must be visible to MapBuffer/GetBufferSubData after
         // End; the capture targets are host-coherent GPU memory, so completing
         // the GPU work is all that is required.
+        //
+        // P5 (b1): UNDER SPLIT THE UNBOUNDED WAIT GOES AND THE MARK ABOVE REPLACES IT. The
+        // wait exists for one reason - so that a later MapBuffer sees real captured results -
+        // and that is precisely what m_gpuWritePending says; SyncGpuWrites then pays for it
+        // once, on the first read that actually wants the bytes, instead of on every
+        // glEndTransformFeedback. A ~0ull ClientWaitSync on the GL thread is also the one
+        // shape a verb barrier cannot make cheap, because it is the driver's wait and not the
+        // barrier's.
         auto& backendGL = MG_Backend::gBackendFunctionsTable.GL;
-        if (backendGL.FenceSync && backendGL.ClientWaitSync) {
+        const Bool waitForTheCapture =
+            MG_Config::Transport == MG_Config::TransportMode::Monolith;
+        if (waitForTheCapture && backendGL.FenceSync && backendGL.ClientWaitSync) {
+            MGP_FILL(FenceSync);
             if (auto sync = backendGL.FenceSync()) {
+                MGP_FILL(ClientWaitSync);
                 backendGL.ClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, ~0ull);
                 if (backendGL.DeleteSync) {
+                    MGP_FILL(DeleteSync);
                     backendGL.DeleteSync(sync);
                 }
             }
@@ -1349,6 +1432,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
         MG_State::pGLContext->SetTransformFeedbackPaused(true);
         if (const auto pauseXfb = MG_Backend::gBackendFunctionsTable.GL.PauseTransformFeedback) {
+            MGP_FILL(PauseTransformFeedback);
             pauseXfb();
         }
     }
@@ -1363,6 +1447,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
         MG_State::pGLContext->SetTransformFeedbackPaused(false);
         if (const auto resumeXfb = MG_Backend::gBackendFunctionsTable.GL.ResumeTransformFeedback) {
+            MGP_FILL(ResumeTransformFeedback);
             resumeXfb();
         }
     }
@@ -1568,6 +1653,7 @@ namespace MobileGL::MG_Impl::GLImpl {
                 continue;
             }
             if (const auto deleteXfb = MG_Backend::gBackendFunctionsTable.GL.DeleteTransformFeedback) {
+                MGP_FILL(DeleteTransformFeedback);
                 deleteXfb(id);
             }
             MG_State::pGLContext->MarkTransformFeedbackObjectForDeletion(id);
@@ -1599,6 +1685,7 @@ namespace MobileGL::MG_Impl::GLImpl {
         }
         MG_State::pGLContext->BindTransformFeedbackObject(id);
         if (const auto bindXfb = MG_Backend::gBackendFunctionsTable.GL.BindTransformFeedback) {
+            MGP_FILL(BindTransformFeedback);
             bindXfb(id);
         }
     }

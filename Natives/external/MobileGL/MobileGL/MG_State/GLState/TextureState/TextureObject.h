@@ -13,6 +13,7 @@
 #include "../SamplerState/SamplerObject.h"
 #include <Includes.h>
 #include <MG_Util/Math/VectorTypes.h>
+#include <MG_Pipe/PipeMutation.h>
 
 namespace MobileGL::MG_State::GLState {
     // Texture objects are always SharedPtr-owned (TextureState creates every instance via
@@ -116,7 +117,15 @@ namespace MobileGL::MG_State::GLState {
     class TextureObjectBase : public ITextureObject {
     public:
         TextureObjectBase(TextureTarget target, Uint externalIndex);
+#if MOBILEGL_PIPE_PUSH
+        // P2 step e2. Out of line, and declared only where there is a notice to raise: in a
+        // pull build this stays the implicit `= default` the pre-P2 tree had, which is what
+        // keeps the pull build's symbol set byte-for-byte the pre-P2 one (G1). Declared on the
+        // BASE, so every concrete texture class - 2D, 3D, cube, buffer, view - announces once.
+        virtual ~TextureObjectBase();
+#else
         virtual ~TextureObjectBase() = default;
+#endif
 
         TextureInternalFormat GetFormat() const override;
         TextureTarget GetTarget() const override;
@@ -180,6 +189,13 @@ namespace MobileGL::MG_State::GLState {
             if (m_depthStencilTextureMode == mode) return;
             m_depthStencilTextureMode = mode;
             ++m_textureParamsVersion;
+            MGP_NOTE_AGGREGATE(TextureParams);
+#if MOBILEGL_PIPE_PUSH
+            // D-E3's whole point, at the one site that proves it: the depth-stencil mode of a
+            // texture that is ONLY the READ framebuffer's attachment reaches the driver, because
+            // set_texture_params is addressed by resource and is independent of every binding.
+            PipePublishParams();
+#endif
         }
 
     protected:
@@ -190,6 +206,46 @@ namespace MobileGL::MG_State::GLState {
         // whether a bound texture reaches its native target at all, and a shape change is
         // otherwise invisible to such a memo (no bind moved).
         void BumpShapeVersion();
+
+#if MOBILEGL_PIPE_PUSH
+        // ---- P4a's client emission points (brief D-D1, D-D3, D-E1, D-I1) ----
+        //
+        // NON-VIRTUAL AND PUSH-ONLY, both deliberately: a virtual would grow the vtable and a
+        // member would grow the object, and P4a's admitted-resize set is EMPTY - every edit
+        // that reaches the pull build is inside this guard, so the pull build's symbol set is
+        // byte-for-byte the one it had before the phase.
+        //
+        // DECLARED HERE AND DEFINED IN TextureObject.cpp, which calls the contract's own hooks
+        // in MG_Pipe/PipeMutation.h - the same door BufferObject.cpp uses, and no MG_State
+        // translation unit sees MG_Impl/Pipe/TextureEmit.h at all (c0b, ID-13). They stay
+        // members rather than free calls so the cube's, the view's and the buffer texture's
+        // translation units keep calling an inherited helper.
+        //
+        // resource_respecify, WHOLE-RESOURCE scope: the format setter and the three parameter
+        // setters that move a DESCRIPTOR field without moving the shape (immutable levels,
+        // sample count, fixed sample locations), and a view's creation. The emitter dedupes
+        // this form on the built descriptor, so an over-call costs one 88-byte compare and
+        // never an extra record.
+        void PipePublishDescriptor();
+        // The PER-LEVEL and the CHAIN-CUT forms of the same call (P4a final review C-1). The
+        // applier keeps a pending-upload set per (uploadTarget, level) and drops the entries
+        // against the storage a respecify REPLACES - and the descriptor cannot tell it which:
+        // AllocateStorage is per level and TruncateMipmapLevels removes a tail, while the
+        // descriptor carries the base extent and the level count only. So the storage entry
+        // points state the scope themselves; the whole-resource form above is for the calls
+        // that really redefine the whole store. A per-level form is NOT deduped on the
+        // descriptor: a non-base level redefined at a new size moves no descriptor field, and
+        // the applier's box against the old level has to go regardless.
+        void PipePublishLevelDescriptor(TextureUploadTarget uploadTarget, Uint mipmapLevel);
+        void PipePublishTruncatedDescriptor(TextureUploadTarget uploadTarget, Uint levelCount);
+        // set_texture_params, from every mutator that bumps m_textureParamsVersion.
+        void PipePublishParams();
+        // The sub-data DRAIN LIST's append, on a level's first dirty mark. There is no clean
+        // arm: the contract's hook (MG_Pipe/PipeMutation.h) carries no `dirty` flag, and a
+        // level that goes clean is collected at the next drain, where !IsStorageDirty is the
+        // first test EmitOneLevel makes.
+        void PipeNoteLevelDirty(TextureUploadTarget uploadTarget, Uint mipmapLevel);
+#endif
 
         const Uint m_externalIndex;
         const Uint64 m_lifetimeId;

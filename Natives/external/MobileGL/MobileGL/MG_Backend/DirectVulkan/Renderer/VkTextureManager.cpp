@@ -11,8 +11,10 @@
 #include "ProgramFactory.h"
 
 #include "MG_State/GLState/Core.h"
+#include <MG_Pipe/PipeInputsSwitch.h>
 #include "MG_Util/Converters/MGToStr/TextureEnumConverter.h"
 #include "MG_Util/Converters/MGToVk/TextureEnumConverter.h"
+#include "MG_Util/Metrics/PipeStats.h"
 
 #include <Config.h>
 #include <algorithm>
@@ -805,7 +807,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             // sampled-texture sync scan the entire alive-texture map per draw.
             if (aliveIt == m_aliveObjects.end()) {
                 WeakPtr<MG_State::GLState::ITextureObject> aliveTexture;
-                const auto& liveTexture = MG_State::pGLContext->GetTextureObject(texture.GetExternalIndex());
+                const auto& liveTexture = MGB_CTX->GetTextureObject(texture.GetExternalIndex());
                 if (liveTexture && liveTexture.get() == &texture) {
                     aliveTexture = liveTexture;
                 } else {
@@ -948,7 +950,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         const Bool framebufferSrgbEnabled =
-            MG_State::pGLContext->IsCapabilityEnabled(MobileGL::CapabilityInput::FramebufferSrgb);
+            MGB_CTX->IsCapabilityEnabled(MobileGL::CapabilityInput::FramebufferSrgb);
         const VkFormat baseAttachmentFormat =
             viewFormatOverride != VK_FORMAT_UNDEFINED ? viewFormatOverride : resource->format;
         const VkFormat attachmentFormat =
@@ -1742,6 +1744,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     Bool VkTextureManager::SyncTexture(MG_State::GLState::ITextureObject &texture,
                                        TextureResource &outResource) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5c (gt): Magma's texture sync still reads - and clears - the CLIENT's mip shadow:
+        // the dirty scan below, and UploadDirtyMipLevels' texel reads / region reads /
+        // MarkStorageDirty(false) clears. CONTRACT-P5C §2 migrated Espryt's sync and Magma's
+        // T5 writes, and left THIS path on the legacy arm; under the verb barrier and one
+        // address space the reads answer correctly, and the migration is P7's server-side
+        // sync. The scope is the debt's greppable form (MipmapStorage.h); outside it the
+        // layer-1 guard still aborts.
+        const MG_State::GLState::MGPipeTextureLegacyArmScope textureLegacyArm;
+#endif
         // Cross-draw fast path: if the resource is already built and neither the texture's
         // pixel content (bumped in MarkStorageDirty), its SHAPE (bumped in BumpShapeVersion)
         // nor its params changed since the last sync, there is nothing to re-check or
@@ -3148,6 +3160,32 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 continue;
             }
             packBox(dst, item.regionLo, item.regionSize);
+        }
+
+        if (MG_Util::PipeStats::Enabled()) {
+            // Same shape split as Espryt's: one union box per item, or one job per rect of
+            // a refined rect list. The box/rect decision is invisible to SSIM and is what
+            // the +6 ms/frame Mali cliff of section 7.3 was, so it is counted apart from
+            // the bytes.
+            Uint64 boxEmissions = 0;
+            Uint64 rectEmissions = 0;
+            Uint64 jobs = 0;
+            for (const auto& item : uploadItems) {
+                if (item.rects.empty()) {
+                    ++boxEmissions;
+                    jobs += isCombinedDepthStencil ? 2u : 1u;
+                } else {
+                    ++rectEmissions;
+                    jobs += static_cast<Uint64>(item.rects.size());
+                }
+            }
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageTexture,
+                                         static_cast<Uint64>(stagingSize));
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::TextureUploadEmissions,
+                                         static_cast<Uint64>(uploadItems.size()));
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::TextureUploadBoxEmissions, boxEmissions);
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::TextureUploadRectEmissions, rectEmissions);
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::TextureUploadJobs, jobs);
         }
 
         const VkImageAspectFlags aspectMask = GetAspectMaskForFormat(outResource.format);

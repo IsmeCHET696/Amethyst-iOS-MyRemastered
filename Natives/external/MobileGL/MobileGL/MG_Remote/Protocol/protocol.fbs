@@ -1,0 +1,291 @@
+// MobileGL - MobileGL/MG_Remote/Protocol/protocol.fbs
+// Copyright (c) 2025-2026 MobileGL-Dev
+// Licensed under the GNU Lesser General Public License v3.0:
+//   https://www.gnu.org/licenses/gpl-3.0.txt
+//   https://www.gnu.org/licenses/lgpl-3.0.txt
+// SPDX-License-Identifier: LGPL-3.0-only
+// End of Source File Header
+
+// MobileGL disaggregated wire protocol - CONTROL PLANE ONLY.
+//
+// Plan B (docs plan "MGPipe") section 8.1 inherits the transport design of the
+// earlier plan verbatim, and its section 7.1 splits the schema in two:
+//
+//   - rare / variable-length / must-evolve messages -> FlatBuffers *tables*,
+//     carried as complete framed messages over the control channel. That is
+//     everything in this file.
+//   - the hot path -> FlatBuffers *structs* (fixed layout, no vtable, no
+//     offset indirection) written straight into the SEG_CMD ring. Those
+//     records are generated from MG_Pipe/PipeCalls.def and are deliberately
+//     NOT in this schema yet: the call catalogue is a separate P0 deliverable
+//     and record numbering must never churn.
+//
+// Regeneration: scripts/gen_protocol.py (flatc is NOT part of the default
+// build graph). generated/protocol_generated.h is committed and CI's
+// flatc-check regenerates it and runs `git diff --exit-code`.
+
+namespace MobileGL.Wire;
+
+// ---------------------------------------------------------------------------
+// Segments
+// ---------------------------------------------------------------------------
+
+// Segment layout is inherited unchanged (earlier plan section 6.1):
+// SEG_CMD 8MiB / SEG_STAGE 32MiB+ / SEG_REPLY 8MiB / SEG_EVENT 256KiB /
+// SEG_SHADOW[n] / SEG_ADOPT[n].
+enum SegmentKind : ubyte {
+  None = 0,
+  Cmd = 1,     // client-owned command ring (RingControl + records)
+  Stage = 2,   // client-owned bulk staging
+  Reply = 3,   // server-owned reply pool
+  Event = 4,   // server-owned event ring
+  Shadow = 5,  // client-owned per-object shadow (P4.5+)
+  Adopt = 6,   // server-owned adopted store, client RW (>= 16MiB)
+}
+
+// The fd itself never travels in a message: POSIX passes it with SCM_RIGHTS on
+// the aux socket (ITransport::ShareFd), Windows resolves `name`.
+table SegmentRef {
+  id: uint;
+  kind: SegmentKind;
+  sizeBytes: ulong;
+  name: string;
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+// ---------------------------------------------------------------------------
+
+table Hello {
+  abiMajor: uint;
+  abiMinor: uint;
+  buildFingerprint: string;
+  backendType: uint;
+  pid: uint;
+  configBlob: [ubyte];
+  // CONTRACT-P5 table 0, "ABI agreement": MGPCaps has only a COMPOSITIONAL size
+  // assertion, because DynamicBackendParameters still carries SizeT and GLenum.
+  // So the two peers assert they were built from the same struct shapes instead
+  // of rewriting them fixed-width (that is P7's account). This is
+  // MG_Remote::CapsAbiFingerprint(): sizeof(DynamicBackendParameters),
+  // sizeof(MGPCaps), sizeof(GLFunctionsTable), the protocol ABI version and the
+  // build's git stamp, mixed. A mismatch is Fatal{AbiMismatch} and NEVER a
+  // downgrade - every alternative silently reads one struct as another.
+  abiFingerprint: ulong;
+}
+
+table Welcome {
+  abiMajor: uint;
+  abiMinor: uint;
+  serverPid: uint;
+  cmdRing: SegmentRef;
+  stageRing: SegmentRef;
+  replyPool: SegmentRef;
+  eventRing: SegmentRef;
+  // The server's half of the assertion above. The string is carried beside the
+  // mixed value only so a mismatch can name both builds in the Fatal line; the
+  // COMPARISON is on abiFingerprint, which also covers the three sizeofs the
+  // string cannot.
+  buildFingerprint: string;
+  abiFingerprint: ulong;
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+// Replaces the 40 `pActiveBackendObject->` reads plus the 89 caps read sites
+// (plan B appendix A, `get_caps`). The three blobs are byte-for-byte images of
+// the corresponding POD structs; they are versioned by structSize-first
+// discipline, not by this schema.
+// The four fields this table used to end with are RETIRED (CONTRACT-P5 table 0,
+// "CapsSnapshot redundancy"):
+//
+//   maxComputeWorkGroupCount / maxComputeWorkGroupSize - they ride inside
+//     `dynamicParameters` already (BackendObject.h:392-393), and two spellings of
+//     one number is how the two sides come to disagree about it.
+//   tableSlotMask - GLFunctionsTable has SIXTY-NINE function-pointer slots
+//     (BackendObject.h:117-292) and a ulong is 64 bits, so the field could never
+//     address the table its own comment named; and ARCHITECTURE.md:114 already
+//     retired "is this table slot null" as the capability probe in favour of
+//     CallMask, so keeping it would re-introduce exactly what replaced it.
+//   prefersCpuXfbPrimitiveAccounting - answered by kCapCpuXfbPrimitiveAccounting
+//     in `callMask` below.
+//
+// THEY ARE `(deprecated)`, NOT DELETED, AND THAT IS NOT A STYLE CHOICE. In
+// FlatBuffers a table field's id IS its vtable slot, and REMOVING a field FREES
+// that slot for the next field appended to the table - so plainly deleting these
+// four would have handed slots 14 and 16, which used to carry `[int]` vectors
+// (4-byte uoffsets), to `callMask` (an 8-byte inline ulong) and `backendType` (a
+// 4-byte inline uint). Two peers straddling that edit both still announce
+// abiMajor 1, and the ABI fingerprint mixes struct sizes and a git stamp, not the
+// schema, so neither the handshake nor the fingerprint could see it: the reader
+// would parse a uoffset as a ulong. `(deprecated)` keeps 14/18/20 burned, pushes
+// the two new fields to 22/24, generates no accessor for the retired names so
+// nothing can read or write them, and costs zero bytes on the wire. The
+// alternative - bumping MOBILEGL_PROTOCOL_ABI_MAJOR - is a real break for a
+// change that does not need to be one.
+table CapsSnapshot {
+  dynamicParameters: [ubyte];
+  rendererInfo: [ubyte];
+  formatCaps: [ubyte];
+  extensions: [string];
+  apiVersion: string;
+  maxComputeWorkGroupCount: [int] (deprecated);
+  maxComputeWorkGroupSize: [int] (deprecated);
+  tableSlotMask: ulong (deprecated);
+  prefersCpuXfbPrimitiveAccounting: bool (deprecated);
+  // MGPCaps::CallMask (MGPipeTypes.h:127). Bits 0..8 are MGPCapBit; bits 32..47
+  // are the CONSUMER MASK - bit (32+n) means "the server has a consumer for
+  // MGPipe subsystem bit n" - and MG_Remote/CapsCodec.h holds the four constexprs
+  // that are the only legal way to fold and test them. It needs a carrier of its
+  // own because `dynamicParameters` is the image of DynamicBackendParameters,
+  // which CallMask is not a member of; and without a carrier R-8's rule that the
+  // client's liveness gates read the caps mirror has nothing to read.
+  callMask: ulong;
+  // The SERVER's backend type, for CapsMirror::Backend(). Hello.backendType is
+  // the CLIENT's request; this is the answer, and the frontend branches that
+  // switch on it (GL_Framebuffer.cpp:47, GL_Texture.cpp:6536, CompileEnv.cpp:122)
+  // take a wrong arm rather than fail on a value they do not know, so it may not
+  // be guessed from the renderer string.
+  backendType: uint;
+}
+
+table DefaultFramebufferInfo {
+  width: int;
+  height: int;
+  colorFormat: uint;
+  depthFormat: uint;
+  stencilFormat: uint;
+}
+
+// ---------------------------------------------------------------------------
+// Surface / EGL lifecycle
+// ---------------------------------------------------------------------------
+
+enum SurfaceOpKind : ubyte {
+  None = 0,
+  InitializeDisplay = 1,
+  CreateWindowSurface = 2,
+  CreatePbufferSurface = 3,
+  ResizeWindowSurface = 4,
+  ReleaseSurface = 5,
+  MakeCurrent = 6,
+  ReleaseCurrent = 7,
+}
+
+enum WindowKind : ubyte {
+  None = 0,
+  AndroidNativeWindow = 1,
+  X11 = 2,
+  Win32Hwnd = 3,
+  Surfaceless = 4,
+  Pbuffer = 5,
+}
+
+table SurfaceOp {
+  seq: ulong;
+  kind: SurfaceOpKind;
+  display: ulong;
+  surface: ulong;
+  windowKind: WindowKind;
+  nativeToken: ulong;   // X11 XID / HWND; Android transfers the window out of band
+  width: int;
+  height: int;
+  swapInterval: int;
+}
+
+table SurfaceReply {
+  seq: ulong;
+  ok: bool;
+  eglMajor: int;
+  eglMinor: int;
+  defaultFb: DefaultFramebufferInfo;
+}
+
+// ---------------------------------------------------------------------------
+// Resync / aux / diagnostics
+// ---------------------------------------------------------------------------
+
+// Sent by the client after it observes a serverEpoch bump (context lost or
+// server restart): every cached ring offset and every server-side object is
+// gone and the whole pushed state has to be replayed.
+table ResyncRequest {
+  serverEpoch: uint;
+}
+
+table ResyncDone {}
+
+enum AuxRequestKind : ubyte {
+  None = 0,
+  FenceClientWait = 1,
+  QueryResult = 2,
+  ScalarGet = 3,
+}
+
+// Requests issued from a thread that is not the ring producer (foreign-thread
+// sync / query polling), so they cannot take the SPSC ring.
+table AuxRequest {
+  seq: ulong;
+  kind: AuxRequestKind;
+  payload: [ubyte];
+}
+
+enum FatalCode : uint {
+  None = 0,
+  ProtocolCorruption = 1,  // record bounds / self-describing length violated
+  RingOverrun = 2,
+  SegmentMismatch = 3,
+  DeviceLost = 4,
+  ServerCrashed = 5,
+  AbiMismatch = 6,
+}
+
+table Fatal {
+  code: FatalCode;
+  message: string;
+}
+
+// Severity-graded per plan B section 8.2: <= Warn is lossy, >= Error is
+// lossless and rate limited.
+enum LogLevel : ubyte {
+  Debug = 0,
+  Info = 1,
+  Warn = 2,
+  Error = 3,
+  Fatal = 4,
+}
+
+table LogLine {
+  level: LogLevel;
+  text: string;
+}
+
+// ---------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------
+
+// Union tags are wire values: only ever APPEND to this list.
+// ProgramReflection from the earlier plan's section 7.1 is intentionally
+// absent - plan B ships program artifacts inside the create_shader_state CSO
+// blob, so if a control-plane reflection message is ever needed it appends
+// here rather than reserving a tag today.
+union CtrlMsg {
+  Hello,
+  Welcome,
+  CapsSnapshot,
+  SurfaceOp,
+  SurfaceReply,
+  ResyncRequest,
+  ResyncDone,
+  AuxRequest,
+  Fatal,
+  LogLine,
+}
+
+table CtrlEnvelope {
+  msg: CtrlMsg;
+}
+
+root_type CtrlEnvelope;
+file_identifier "MGLC";

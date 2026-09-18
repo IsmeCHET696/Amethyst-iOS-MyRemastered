@@ -14,7 +14,7 @@ namespace MobileGL::MG_Config {
     inline const String ProjectName = "MobileGL";
     inline const String CoreName = "MobileGL Core";
     inline const String CoreVendor = "MobileGL-Dev (BZLZHH, Swung0x48, Tungsten)";
-    inline const Version CoreVersion = {26, 8, 0, "-dev", VersionType::Development};
+    inline const Version CoreVersion = {26, 9, 0, "-dev", VersionType::Development};
     inline const VersionStringFormatAttrib DefaultVersionStringFormatAttrib = {2, 2, 0, true, true};
     inline const Uint64 CacheVersion = 0;
 
@@ -316,6 +316,240 @@ namespace MobileGL::MG_Config {
         // immune to the probe's verdict moving), and ForceOff is the negative control that
         // replays the driver's silence.
         QuirkOverride MagmaPrimGenQueryReroute = QuirkOverride::Auto;
+        // --- MGPipe (the disaggregation plan's explicit frontend/backend boundary) ---
+        // MOBILEGL_PIPE_PUSH: per-subsystem bitmask selecting which state the frontend
+        // PUSHES over MGPipe instead of leaving the backend to pull it out of GLContext.
+        // 0 - the only shipped value until the migration lands - is "pull everything",
+        // i.e. exactly today's behaviour, and is the default of a PULL build, where the
+        // knob is meaningless anyway. A PUSH build defaults to every subsystem migrated so
+        // far (MG_Pipe::kMGPipeSubsystemsMigratedAtP5e = 0x3fff), so MOBILEGL_PIPE_PUSH=0 in
+        // the environment is the all-pull control and 0x1fff (kMGPipeSubsystemsMigratedAtP4a)
+        // is the "everything before P5e" control P5e's A/B is run against - each phase's
+        // constant survives as the next phase's control, which is why none of them is ever
+        // edited. Accepts decimal or 0x-prefixed hex, and operators pass it as hex, so the
+        // bits are listed here (MG_Pipe/MGPipe.h owns them):
+        //   0x01 render state (create/bind_render_state + set_dynamic_state)
+        //   0x02 pixel pack        0x04 patch state      0x08 vertex attrib defaults
+        //   0x10 residual values   0x20 Espryt slots     0x40 Magma vertex input
+        //   0x80 resources (the resource_* family: the seven BufferBackendOps hooks)
+        //   0x100 vertex input (vertex elements / vertex buffers / index buffer)
+        //   0x200 framebuffer (set_framebuffer_state)              - requires 0x400
+        //   0x400 texture resources (texture + renderbuffer resource_*,
+        //         set_texture_params)                              - requires 0x80 AND 0x800
+        //         (the built-in sampler CSO a set_texture_params record names is minted by
+        //         the sampler family alone, ID-15; the four rows are MG_Impl/Pipe/PipeFill.cpp's
+        //         kMGPipeP4aFamilyDependencies, mirrored bit for bit by Espryt's resolvers)
+        //   0x800 samplers (sampler CSO, sampler view, set_sampler_views /
+        //         bind_sampler_states / set_shader_images)         - requires 0x400
+        //   0x1000 programs (shader CSO, set_draw/dispatch_program, global constants)
+        //   0x2000 buffer binding points (set_shader_buffers, the three indexed binding-point
+        //         classes and the dirty bits 15/16/17)             - requires 0x80
+        //         (every MGPBufferRange::Res names a Buffer handle; P5e)
+        //   A dependency that is not met is REFUSED with one ERROR naming both bits and the
+        //   family runs its legacy arm; it is never half-run.
+        //   1<<63 NOT a subsystem, a BEHAVIOUR: turn OFF client-side content addressing of
+        //         CSOs, so every pipeline-version change mints a fresh CSO and the map is
+        //         never probed. The negative control the CSO design is measured against.
+        Uint64 PipePush = 0;
+        // MOBILEGL_PIPE_VERIFY: per-draw, per-FIELD shadow comparison of the pushed state
+        // against a snapshot taken from GLContext the old way, printing the first field
+        // that differs and the draw serial. Roughly 5-10x slower and never shipped; it is
+        // the semantic gate that replaces byte identity, and it catches the dangerous
+        // direction - a dirty bit that fires too RARELY - which no purity gate can see.
+        Bool PipeVerify = false;
+#if MOBILEGL_PIPE_PUSH
+        // The three knobs of the MOBILEGL_PIPE_VERIFY build (P1 brief D2). Compiled only
+        // under MOBILEGL_PIPE_PUSH so the pull build's FeaturesTable does not change size.
+        // MOBILEGL_PIPE_VERIFY_FATAL: the first divergence aborts (default). 0 logs and
+        // counts instead, for triage and for the lane that must survive to read its own
+        // log. Tri-state parse like PipeLegacyMemos: only an explicit falsy value turns it
+        // off.
+        Bool PipeVerifyFatal = true;
+        // MOBILEGL_PIPE_VERIFY_CORRUPT: a field name from kMGPipeInputFieldNames[]; the
+        // comparator perturbs that field in the SNAPSHOT arm before the entry compare, so a
+        // green verify run goes red naming it (negative control A). Unknown name is
+        // Fatal{PipeVerifyBadKnob}.
+        String PipeVerifyCorrupt;
+        // MOBILEGL_PIPE_POISON_OMIT: <Verb>:<FieldName>; the filler skips the STAMP (not
+        // the value) of that field for that verb, an omission indistinguishable from a
+        // forgotten FillPoints.def row, so that verb's read of it is
+        // Fatal{UnmigratedPipeInput} (negative control B). Unknown name is
+        // Fatal{PipeVerifyBadKnob}.
+        String PipePoisonOmit;
+        // MOBILEGL_PIPE_HANDLE_ABA_CONTROL (negative control C, P2 brief D18): replace the
+        // OBJECT IDENTITY in every DirectVulkan vertex-input memo key with a constant, on
+        // whichever arm the run is on - the pre-handle (address, lifetime id) pair AND the
+        // handle arm's {slot, gen} generation - so a replacement object inherits its dead
+        // predecessor's resolved vertex bindings and HandleRecycleScenario.AbaControl asserts
+        // the WRONG pixels. That is what proves the reproducer still reproduces. D18 wrote
+        // this as "hash the raw BufferObject* instead of its lifetime id"; measured, the heap
+        // block is never handed back, so that spelling collided with nothing and the control
+        // went vacuous - see MagmaPipeArms.h's MagmaPipeAbaControlDefeatsIdentity for the
+        // measurement and for what the control still leaves standing. Under
+        // MOBILEGL_PIPE_PUSH only, so it cannot exist in a shipping pull build.
+        Bool PipeHandleAbaControl = false;
+#endif
+        // MOBILEGL_PIPE_STATS: dump the boundary counters (bytes, calls, roundtrips,
+        // texture pulls, upload shapes, residual-block bytes, index mirror bytes).
+        Bool PipeStats = false;
+        // MOBILEGL_PIPE_LEGACY_MEMOS: keep the pre-handle registries and TwinLookupMemos
+        // alive so the first handle waves have a real old-versus-new arm to be compared
+        // against. ON by default for the whole migration window, deleted with the pull
+        // path itself.
+        Bool PipeLegacyMemos = true;
+        // MOBILEGL_PIPE_TEXEL_RETAIN_MB: LRU budget for texels retained against a
+        // server-initiated texture re-send. Default 0, i.e. OFF: MipmapStorage already
+        // holds a complete CPU shadow, so this cache buys latency, never correctness.
+        Uint32 PipeTexelRetainMb = 0;
+        // MOBILEGL_PIPE_INDEX_MIRROR_MB: budget for the server-side index host mirror,
+        // which is what lets primitive-restart rewriting and multi-draw flattening stay on
+        // the server without shipping index bytes per draw. Over budget it degrades to
+        // per-draw staging, counted separately in the stats.
+        Uint32 PipeIndexMirrorMb = 64;
+        // MOBILEGL_PIPE_STATS_PERIOD: frames per boundary-counter summary line. 120 is the
+        // steady-state cadence; the device retrace harness never reaches the teardown dump
+        // and a trimmed fixture (create-indirect) is shorter than 120 frames, so a run that
+        // needs its numbers at all sets this low enough to land at least one window.
+        Uint32 PipeStatsPeriod = 120;
+        // MOBILEGL_PIPE_STATS_FILE: where the boundary counters' teardown JSON dump goes.
+        // Empty (the default) means no dump; the per-120-frame summary line still goes to
+        // the log whenever PipeStats is on, so a device run needs no writable path.
+        String PipeStatsFile;
     };
     extern FeaturesTable Features;
+
+    // ---------------------------------------------------------------------------------
+    // P5: the transport selector and the MOBILEGL_IPC_* family (ARCHITECTURE.md 16, 附 A)
+    // ---------------------------------------------------------------------------------
+    //
+    // MOBILEGL_TRANSPORT = monolith | inproc | spawn | unix:<path> | pipe:<name>.
+    //
+    // WHY `Transport` IS NOT A FeaturesTable MEMBER. ARCHITECTURE.md:580 requires that with
+    // MOBILEGL_BUILD_DISAGGREGATED=OFF it be a `constexpr Monolith`, so that the single hook
+    // in MG_Backend/Init.cpp compiles away entirely rather than becoming a branch nobody can
+    // take. A FeaturesTable member is a runtime field in every build, which is the opposite
+    // of that; it would also resize MG_Config::Features and break G1 (the pull build's
+    // symbol set must not move) for the same reason the MOBILEGL_PIPE_VERIFY knobs above sit
+    // behind their own #if.
+    //
+    // ONE CONSEQUENCE, STATED SO IT IS NOT REDISCOVERED: in a build without the option,
+    // MOBILEGL_TRANSPORT=inproc is ACCEPTED BY THE ENVIRONMENT AND SILENTLY IGNORED - the
+    // parser below does not exist to complain about it, and putting a complaint in the
+    // unconditional part of ConfigLoader would move a pull-build symbol. That is the exact
+    // shape of "the split lane ran monolith and went green", so the gate against it is a
+    // BUILD-level check, not a runtime one: `nm --defined-only libMobileGL.so | grep -i
+    // MG_Remote` must be non-empty in build-split (CONTRACT-P5.md table 3, and the CI job
+    // P5 adds beside build-linux-verify).
+    enum class TransportMode : Uint8 {
+        Monolith = 0,  // today's in-library backend; no MG_Remote object is constructed
+        InProcess = 1, // P5: a real apply thread in this process, over the same G3 codec
+        Spawn = 2,     // P6: fork/exec MobileGLServer, socketpair
+        UnixSocket = 3,// P6: connect to an existing AF_UNIX endpoint (Endpoint = <path>)
+        NamedPipe = 4, // P6: Windows named pipe (Endpoint = <name>)
+    };
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // Parsed once by MG_ConfigLoader::Init(). Defaults to Monolith even here: building the
+    // transport in is not the same as using it, and every existing lane of a build-split
+    // must keep running monolith unless it is asked for one.
+    extern TransportMode Transport;
+    // The <path> of `unix:` / the <name> of `pipe:`. Empty for the other three modes.
+    extern String TransportEndpoint;
+
+    // The MOBILEGL_IPC_* family. A separate table rather than more FeaturesTable members,
+    // for the G1 reason above and because every field here is meaningless without the
+    // transport: a build that cannot reach the MG_Remote code cannot honour one of them.
+    //
+    // P5 lands exactly the knobs P5's own packages read. A later phase's knob is added HERE,
+    // through the integrator, and not invented at its call site - ARCHITECTURE.md:615 holds
+    // the full planned inventory (PRESENT_CREDIT, POLL_ESCALATE, SHADOW_SHM,
+    // INLINE_PAYLOADS, TRACE, ATTACH, RESPAWN, IDLE_EXIT_S), and every one of those belongs
+    // to P6 or later.
+    struct IpcTable {
+        // MOBILEGL_IPC_SERVER_PATH: where to find libMobileGLServer. P6 consumes it; P5
+        // lands the parse because t1's ctest ENVIRONMENT blocks and add_trace_replay_test's
+        // SPLIT variant already carry it, and an environment variable that nothing parses is
+        // indistinguishable from one that is parsed and ignored.
+        String ServerPath;
+        // MOBILEGL_IPC_RING_MB: SEG_CMD size. A RECORD MAY BE AT MOST HALF OF THIS
+        // (RingProducer::MaxRecordBytes), so 8 MiB caps one record at 4 MiB; R-10 makes the
+        // codec publish a max-record-bytes counter rather than assume that is enough.
+        Uint32 RingMb = 8;
+        // MOBILEGL_IPC_STAGE_MB: SEG_STAGE size. Every blob and every var-tail's bytes live
+        // here (R-10: no chunking in P5, so nothing may exceed it).
+        Uint32 StageMb = 32;
+        // MOBILEGL_IPC_SPIN_US: spin before parking on a doorbell, either direction.
+        Uint32 SpinUs = 50;
+        // MOBILEGL_IPC_PERSISTENT_BLOCK_KB: block granularity of the persistent-map push.
+        // 0 IS A NEGATIVE CONTROL, NOT "unlimited": it disables the push, and
+        // PersistentCoherentMapScenario must go RED under it (exit gate E3(a)).
+        Uint32 PersistentBlockKb = 64;
+        // MOBILEGL_IPC_PERSISTENT_HASH_SUPPRESS: 1 = the persistent-map push ships only
+        // blocks whose xxHash64 changed since the last push, instead of the whole mapped
+        // range every verb. 0 restores the whole-range push (A/B control).
+        Uint32 PersistentHashSuppress = 1;
+        // MOBILEGL_IPC_BATCH_WAITS: 1 = value-class records (kCtxState / kCtxCso / kCtxObject
+        // with no reply slot) are published without waiting for their own apply; the barrier
+        // is taken at the next pull-reading verb (kCtxVerb syncs, queries, screen rows, and
+        // every reply-slot row), which is the only place BARRIER-PULLED fields are read. 0
+        // restores the per-record barrier of R-1.
+        Uint32 BatchWaits = 1;
+        // MOBILEGL_IPC_ADOPT_TIER: 2 = emulate (client keeps the shadow and pushes), which
+        // is the only tier P5 implements and the reason persistent-map-push can be non-zero
+        // at all (R-6). 0 and 1 parse and are Fatal at use with "P11"; they exist now so the
+        // negative control has a spelling the day P11 writes it.
+        Uint32 AdoptTier = 2;
+        // MOBILEGL_IPC_VERB_BARRIER: 1 = the client blocks at every verb boundary until
+        // appliedSeq reaches its emitSeq (R-1). 0 is the negative control: it is EXPECTED to
+        // be red, because 31 of the 63 PipeInputs fields are still pulled from a live
+        // GLContext by the client's residual fill and a free-running queue lets the server
+        // read a FUTURE value of them.
+        Uint32 VerbBarrier = 1;
+        // MOBILEGL_IPC_RUN_AHEAD (P5e, MG_Remote/CONTRACT-P5E.md §1): 1 = after publishing an
+        // UNBARRIERED record the client returns immediately instead of waiting for its apply.
+        // It is one half of a conjunction and never a switch on its own - the client arms
+        // run-ahead only when the server also publishes kCapRunAheadApply, so on Magma, and on
+        // Espryt before the P5e integration commit, 1 means exactly what 0 means and logs once
+        // saying so.
+        //
+        // 0 IS THE A/B CONTROL AND NOT A NEGATIVE ONE: the server code, the fill decision and
+        // every record are identical on both arms, and the only difference is whether the
+        // client waits. That is what makes "is the picture the same" a question about the wait
+        // rule alone. MOBILEGL_IPC_VERB_BARRIER=0 keeps its own meaning and stays the
+        // lockstep arm's negative control; under run-ahead it is the one that must go red, at
+        // the first barriered row's stale pull.
+        //
+        // Forced to 0 by MOBILEGL_PIPE_VERIFY, beside BatchWaits: the comparator needs a
+        // client-filled gPipeInputs block for every verb, and run-ahead is precisely the
+        // arm that stops filling it.
+        Uint32 RunAhead = 1;
+        // MOBILEGL_IPC_PRESENT_CREDIT (P5e, ruling 4 / ID-92): how many presents the client may
+        // have in flight before it waits for a swap to come back. 1 = the client publishes
+        // frame N+1's records while the server applies and swaps frame N - one frame of
+        // overlap, at most one frame of added latency - and the CREDIT, never the ring's bytes,
+        // is what paces a run-ahead client. 2 is a device MEASUREMENT arm: it buys no CPU on a
+        // client that is already CPU-bound and costs a frame of latency, which is why the
+        // default is 1 and not "as deep as the ring".
+        Uint32 PresentCredit = 1;
+        // MOBILEGL_IPC_STRICT_ERRORS: promote a BARRIER-PULLED field read - and, in a split
+        // build, the seven sticky forwards that are otherwise exempt - from "count it in
+        // rsp" to Fatal (R-7.3).
+        Bool StrictErrors = false;
+        // MOBILEGL_IPC_AUDIT: after a record retires, the server fills the SEG_STAGE bytes
+        // it referenced with 0xDD (R-2.5). This is the ONLY mechanical control that an
+        // inproc implementation did not quietly keep using a pointer past its lifetime.
+        Bool Audit = false;
+        // MOBILEGL_IPC_SERVER_AFFINITY: `auto` (the default, big-core detection borrowed
+        // from ShaderCompilePool), `off`, or an explicit CPU mask. Kept as the raw string
+        // because the resolved mask is logged by whoever starts the apply thread, and the
+        // string is what an operator typed.
+        String ServerAffinity = "auto";
+    };
+    extern IpcTable Ipc;
+#else
+    // The whole point: in a build without MG_Remote this folds at compile time, so
+    // `if (MG_Config::Transport != MG_Config::TransportMode::Monolith)` in Init.cpp is a
+    // discarded statement and the pull build gains no symbol, no branch and no byte.
+    inline constexpr TransportMode Transport = TransportMode::Monolith;
+#endif
 } // namespace MobileGL::MG_Config

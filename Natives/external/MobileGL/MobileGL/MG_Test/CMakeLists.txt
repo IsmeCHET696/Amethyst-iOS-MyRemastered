@@ -85,6 +85,12 @@ add_subdirectory(VertexArray)
 add_subdirectory(Program)
 add_subdirectory(Query)
 add_subdirectory(Pipeline)
+# The MGPipe catalogue arithmetic: no GL context and no driver, just the .def, the seven
+# generated files and the payload layouts.
+add_subdirectory(Pipe)
+# The P0.5 interface-purity gate: a python walk of #include lines, so it registers with no
+# MobileGL build, no GL context and no submodules (scripts/check_include_closure.py).
+add_subdirectory(Purity)
 add_subdirectory(ShaderTranspiler)
 add_subdirectory(Util)
 add_subdirectory(SelfTest)
@@ -93,4 +99,9 @@ add_subdirectory(SelfTest)
 add_subdirectory(Backend/DirectGLES)
 if (ENABLE_INTEGRATION_TESTS)
     add_subdirectory(Backend/DirectVulkan)
+endif()
+# The wire layer only exists in the disaggregated configuration, so its suite
+# is only registered there. Nothing under MG_Remote is compiled otherwise.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    add_subdirectory(Wire)
 endif()

@@ -10,6 +10,8 @@
 #include "../DirectVulkan.h"
 #include "VulkanRenderer.h"
 
+#include "MG_Util/Metrics/PipeStats.h"
+
 namespace MobileGL::MG_Backend::DirectVulkan {
     namespace {
         constexpr VmaAllocationCreateFlags kResidentBufferAllocationFlags =
@@ -237,8 +239,38 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     Bool VkBufferManager::UploadTransient(BufferKind kind, Uint32 frameIndex, const void* data,
                                           VkDeviceSize size, VkDeviceSize alignment, BufferSlice& outSlice) {
-        (void)kind;
-        return m_transientUploadArena.Upload(frameIndex, data, size, alignment, outSlice);
+        if (!m_transientUploadArena.Upload(frameIndex, data, size, alignment, outSlice)) {
+            return false;
+        }
+        if (MG_Util::PipeStats::Enabled()) {
+            // The single chokepoint for Magma's per-draw staging. Uniform is deliberately
+            // absent: its bytes are counted by the caller, which is the only place that
+            // knows whether the payload is the default block (stage-ubo-global) or a named
+            // one repacked into the ring (stage-ubo-named), and counting here as well would
+            // double every uniform byte.
+            switch (kind) {
+            case BufferKind::Vertex:
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageVertexClient,
+                                             static_cast<Uint64>(size));
+                break;
+            case BufferKind::Index:
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageIndexClient,
+                                             static_cast<Uint64>(size));
+                break;
+            case BufferKind::Indirect:
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageIndirectCmd,
+                                             static_cast<Uint64>(size));
+                break;
+            case BufferKind::TextureBuffer:
+            case BufferKind::ShaderStorage:
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer,
+                                             static_cast<Uint64>(size));
+                break;
+            case BufferKind::Uniform:
+                break;
+            }
+        }
+        return true;
     }
 
     Bool VkBufferManager::InitializeTransientArenas() {
@@ -347,6 +379,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             resource.pendingFullUpload = true;
             return false;
         }
+        if (MG_Util::PipeStats::Enabled()) {
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer, static_cast<Uint64>(size));
+        }
         resource.pendingFullUpload = false;
         return true;
     }
@@ -360,6 +395,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (!m_transientUploadArena.Upload(m_currentFrameIndex, data,
                                            static_cast<VkDeviceSize>(size), 16, staging)) {
             return false;
+        }
+        if (MG_Util::PipeStats::Enabled()) {
+            // The staging fill is the host copy; the vkCmdCopyBuffer below is the device
+            // half of the same bytes and is not counted twice.
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer, static_cast<Uint64>(size));
         }
         VkCommandBuffer commandBuffer = m_copyProvider->AcquireBufferCopyCommandBuffer();
         if (commandBuffer == VK_NULL_HANDLE) {
@@ -430,6 +470,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (!resource->buffer.Upload(bufferObject.MappedData(), size, 0)) {
             MGLOG_E_ONCE("VkBufferManager::OnRespecify: in-place upload failed");
             resource->pendingFullUpload = true;
+        } else if (MG_Util::PipeStats::Enabled()) {
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer, static_cast<Uint64>(size));
         }
     }
 
@@ -455,6 +497,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                          static_cast<VkDeviceSize>(size), static_cast<VkDeviceSize>(offset))) {
                 MGLOG_E_ONCE("VkBufferManager::OnSubData: host upload failed");
                 resource->pendingFullUpload = true;
+            } else if (MG_Util::PipeStats::Enabled()) {
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer,
+                                             static_cast<Uint64>(size));
             }
             return;
         }
@@ -513,6 +558,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                          static_cast<VkDeviceSize>(size), static_cast<VkDeviceSize>(offset))) {
                 MGLOG_E_ONCE("VkBufferManager::OnFlushMappedRange: host upload failed");
                 resource->pendingFullUpload = true;
+            } else if (MG_Util::PipeStats::Enabled()) {
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer,
+                                             static_cast<Uint64>(size));
             }
             return;
         }
@@ -583,6 +631,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const Uint8* seed = bufferObject.MappedData();
         if (seed != nullptr) {
             resource->buffer.Upload(seed, size, 0);
+            if (MG_Util::PipeStats::Enabled()) {
+                // The one-time seed of a persistent map. Everything the app writes AFTER
+                // this goes straight through the mapping and is persistent-map-push
+                // territory (unwired, D4/D-B4), not this class.
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer,
+                                             static_cast<Uint64>(size));
+            }
         }
         resource->persistentMapped = true;
         resource->pendingFullUpload = false;
@@ -630,6 +685,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 resource->storageSize = 0;
                 resource->usageFlags = 0;
                 return false;
+            }
+            if (MG_Util::PipeStats::Enabled()) {
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer,
+                                             static_cast<Uint64>(size));
             }
             resource->pendingFullUpload = false;
         }
@@ -709,6 +768,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (!m_transientUploadArena.Upload(m_currentFrameIndex, bufferObject->MappedData(), size, 16,
                                            outSlice)) {
             return false;
+        }
+        if (MG_Util::PipeStats::Enabled()) {
+            MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::StageBuffer, static_cast<Uint64>(size));
         }
         resource->transientSlice = outSlice;
         resource->transientFrameSerial = m_frameSerial;

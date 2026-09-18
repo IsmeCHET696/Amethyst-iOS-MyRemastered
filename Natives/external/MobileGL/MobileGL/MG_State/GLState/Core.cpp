@@ -14,6 +14,9 @@
 #include <MG_Util/ShaderTranspiler/CompileEnv.h>
 #include <Config.h>
 
+#include <atomic>
+#include <MG_Pipe/PipeMutation.h>
+
 namespace MobileGL::MG_State {
     void Init() {
         MGLOG_D("Initializing MobileGL State...");
@@ -211,6 +214,12 @@ namespace MobileGL::MG_State {
                 current.intValue[component] = static_cast<Int32>(value[component]);
                 current.uintValue[component] = static_cast<Uint32>(value[component]);
             }
+#if MOBILEGL_PIPE_PUSH
+            // The two views above are CONVERSIONS, not bit copies, so which one was written
+            // is part of the value; set_vertex_attrib_defaults carries it.
+            m_currentVertexAttributeClasses[index] = kVertexAttribValueClassFloat;
+#endif
+        MGP_NOTE_AGGREGATE(VertexAttribDefault);
         }
 
         void GLContext::SetCurrentVertexAttributeInt(Uint index, const Array<Int32, 4>& value) {
@@ -225,6 +234,10 @@ namespace MobileGL::MG_State {
                 current.floatValue[component] = static_cast<Float>(value[component]);
                 current.uintValue[component] = static_cast<Uint32>(value[component]);
             }
+#if MOBILEGL_PIPE_PUSH
+            m_currentVertexAttributeClasses[index] = kVertexAttribValueClassInt;
+#endif
+        MGP_NOTE_AGGREGATE(VertexAttribDefault);
         }
 
         void GLContext::SetCurrentVertexAttributeUint(Uint index, const Array<Uint32, 4>& value) {
@@ -239,6 +252,10 @@ namespace MobileGL::MG_State {
                 current.floatValue[component] = static_cast<Float>(value[component]);
                 current.intValue[component] = static_cast<Int32>(value[component]);
             }
+#if MOBILEGL_PIPE_PUSH
+            m_currentVertexAttributeClasses[index] = kVertexAttribValueClassUint;
+#endif
+        MGP_NOTE_AGGREGATE(VertexAttribDefault);
         }
 
         const CurrentVertexAttributeValue& GLContext::GetCurrentVertexAttribute(Uint index) const {
@@ -1195,6 +1212,12 @@ namespace MobileGL::MG_State {
             return m_framebufferState.ValidateFramebufferObject(index);
         }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        SharedPtr<FramebufferObject> GLContext::FindFramebufferObjectByLifetimeId(Uint64 lifetimeId) const {
+            return m_framebufferState.FindFramebufferObjectByLifetimeId(lifetimeId);
+        }
+#endif
+
         // Sampler
         void GLContext::GenSamplerNames(Uint number, Vector<Uint>& samplers) {
             m_samplerState.GenerateNames(number, samplers);
@@ -1259,6 +1282,33 @@ namespace MobileGL::MG_State {
             return m_renderbufferState.ValidateRenderbufferObject(index);
         }
 
+        Uint64 GLContext::AllocateTransformFeedbackLifetimeId() {
+            // Starts at 1 so a zero-initialised backend slot can never carry a live object's id.
+            static std::atomic<Uint64> nextId{1};
+            return nextId.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        GLContext::GLContext() {
+            // The default transform feedback object (name 0) exists from the start of the context
+            // (GL 4.6 core 13.2.1), but nothing binds it, so nothing else would materialise it.
+            // Materialising it here is what lets GetBoundTransformFeedbackLifetimeId() be a plain
+            // const read instead of an operator[] insert on the draw path.
+            m_boundTransformFeedbackLifetimeId = m_transformFeedbackObjects[0].lifetimeId;
+        }
+
+        Bool GLContext::HasOpenTransformFeedbackSpan(Uint64 lifetimeId) const {
+            if (lifetimeId == 0) return false;
+            for (const auto& [name, object] : m_transformFeedbackObjects) {
+                if (object.lifetimeId != lifetimeId) continue;
+                // The bound object's span state is live in the context; its saved copy is only
+                // written when a bind swaps it out.
+                return name == m_boundTransformFeedback ? m_transformFeedbackActive : object.active;
+            }
+            // No object carries this identity any more: it was deleted, and a deleted object can
+            // never resume.
+            return false;
+        }
+
         void GLContext::SaveBoundTransformFeedbackState() {
             auto& object = m_transformFeedbackObjects[m_boundTransformFeedback];
             for (Uint i = 0; i < MAX_TRANSFORM_FEEDBACK_BUFFERS; ++i) {
@@ -1295,6 +1345,9 @@ namespace MobileGL::MG_State {
             m_transformFeedbackGeneration = object.generation;
             m_transformFeedbackCapturedVertices = object.capturedVertices;
             m_transformFeedbackInputPrimitives = object.inputPrimitives;
+            // Every route that changes which object is bound - BindTransformFeedbackObject and the
+            // revert a delete of the bound object performs - comes through here.
+            m_boundTransformFeedbackLifetimeId = object.lifetimeId;
         }
 
         void GLContext::GenTransformFeedbackNames(Uint number, Vector<Uint>& ids) {
