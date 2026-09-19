@@ -136,7 +136,11 @@ namespace FSR1_Context {
     // linker dropped, and glUniform* ignores it, so an unresolved location needs no
     // separate "not found" state.
     GLint g_inputTexLoc = -1;
-    GLint g_const0Loc = -1;
+    // Task 80 (Amethyst fork): uConst0 (vec4, declared but never read by the
+    // upstream shader) is replaced by uTargetSize (vec2) -- the EASU constant
+    // setup needs the upscale output size, which used to be fed the INPUT
+    // texture size instead, collapsing the coordinate mapping to identity.
+    GLint g_targetSizeLoc = -1;
     GLint g_viewportSizeLoc = -1;
 
     GLuint g_targetFBO = 0;
@@ -148,6 +152,15 @@ namespace FSR1_Context {
     GLsizei g_targetHeight = 1080;
     GLsizei g_renderWidth = 1200;
     GLsizei g_renderHeight = 540;
+    // Task 80 (Amethyst fork): the surface size as last seen by
+    // CheckResolutionChange. ApplyFSR blits to the full surface so the presented
+    // frame is full-bleed no matter how the preset scale rounds (render 1814 x
+    // 1.30 = 2358 vs surface 2360 would otherwise leave a stale right-hand
+    // column), and so smaller targets (resolution slider stacked on FSR) get
+    // their final stretch from the blit's linear filter. Zero until the first
+    // CheckResolutionChange -- ApplyFSR then falls back to a 1:1 blit.
+    GLsizei g_surfaceWidth = 0;
+    GLsizei g_surfaceHeight = 0;
     bool g_dirty = false;
 
     bool g_resolutionChanged = false;
@@ -287,14 +300,45 @@ void InitFullscreenQuad() {
 bool fsrInitialized = false;
 void InitFSRResources() {
     fsrInitialized = true;
+    // Task 78 (Amethyst fork): adopt the viewport latch when the application
+    // has already drawn. Before this, the first swap ran on the 960x540
+    // default geometry and the recalc only landed afterwards -- one garbage
+    // frame under the launcher's FSR linkage (MC's window told at
+    // surface/fsr_scale, so its very first viewport IS the render size).
+    // Adopting pending + computing the target here makes the very first
+    // ApplyFSR run on the correct geometry. pending == 0 means no viewport
+    // was latched yet: keep the defaults and let the first swap settle it.
+    if (FSR1_Context::g_pendingWidth > 0 && FSR1_Context::g_pendingHeight > 0) {
+        FSR1_Context::g_renderWidth = FSR1_Context::g_pendingWidth;
+        FSR1_Context::g_renderHeight = FSR1_Context::g_pendingHeight;
+        CalculateTargetResolution(global_settings.fsr1_setting, FSR1_Context::g_pendingWidth,
+                                  FSR1_Context::g_pendingHeight,
+                                  reinterpret_cast<int*>(&FSR1_Context::g_targetWidth),
+                                  reinterpret_cast<int*>(&FSR1_Context::g_targetHeight));
+    }
     // No GUARD_VAO or GUARD_ARRAY_BUFFER: the only thing here that binds either is
     // InitFullscreenQuad, which carries its own guard.
     GLStateGuard state(GUARD_PROGRAM | GUARD_TEXTURE | GUARD_FRAMEBUFFER | GUARD_RENDERBUFFER);
 
     FSR1_Context::g_fsrProgram = CompileFSRShader();
+    // Task 80 (Amethyst fork): compile-failure safety net. Upstream pressed on
+    // with a dead program: the FBOs below came up, the framebuffer-0 redirect in
+    // gl/framebuffer.cpp activated, and ApplyFSR then cleared the target to
+    // black, drew nothing (program 0), and blitted that black over the whole
+    // surface every frame -- fps and swap counters perfectly healthy, screen
+    // perfectly black (0441401: "Shader 3 conversion FAILED ... textureGather
+    // requires ESSL 310" -> raw fallback -> "invalid version directive").
+    // Returning here leaves g_renderFBO at 0: no redirect (MC keeps drawing
+    // straight into the surface), ApplyFSR's own guard no-ops, and the session
+    // degrades to "no upscale" instead of "no picture". fsrInitialized stays
+    // true so glCreateShader does not re-run this on every shader.
+    if (FSR1_Context::g_fsrProgram == 0) {
+        LOG_W_FORCE("[MG] FSR1 upscale shader failed to compile -- machinery NOT engaged, frames present directly (preset bypassed for this session)");
+        return;
+    }
 
     FSR1_Context::g_inputTexLoc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uInputTex");
-    FSR1_Context::g_const0Loc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uConst0");
+    FSR1_Context::g_targetSizeLoc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uTargetSize");
     FSR1_Context::g_viewportSizeLoc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uViewportSize");
 
     // GLES.glUseProgram and not this layer's own: the frontend one writes
@@ -367,8 +411,14 @@ void RecreateFSRFBO() {
 
     GLES.glGenTextures(1, &FSR1_Context::g_renderTexture);
     GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_renderTexture);
-    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, 0,
-                      GL_RGBA, GL_FLOAT, nullptr);
+    // Task 78 (Amethyst fork): RGBA8, matching InitFSRResources above. Upstream
+    // recreated this texture as RGBA32F -- 2x the bytes per frame of pure
+    // bandwidth for an LDR game upscale, inconsistent with its own init path
+    // and with the render texture the application actually drew into before
+    // the first resize. EASU/RCAS quality on RGBA8 input is what the init path
+    // always used anyway.
+    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, 0,
+                      GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -430,15 +480,17 @@ void RecreateFSRFBO() {
 std::vector<std::pair<GLsizei, GLsizei>> g_viewportStack;
 
 void ApplyFSR() {
+    // Task 76 (Amethyst fork): guard for the zero-gain teardown below. The
+    // render FBO is 0 when FSR1 has been torn down (render resolution pinned at
+    // or above the surface size -- nothing to upscale for) or before the first
+    // initialization. Running the body in either state would bind target-FBO 0
+    // and issue a fullscreen pass into whatever the driver considers framebuffer
+    // 0, so the early return keeps both the bypass and the init window safe.
+    if (FSR1_Context::g_renderFBO == 0) return;
     // No GUARD_ARRAY_BUFFER or GUARD_RENDERBUFFER: nothing below binds either.
     // GL_ARRAY_BUFFER_BINDING is context state and not vertex array object state, so
     // the glBindVertexArray below cannot disturb it.
     GLStateGuard state(GUARD_PROGRAM | GUARD_VAO | GUARD_TEXTURE | GUARD_FRAMEBUFFER);
-
-    GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_targetFBO);
-    GLES.glViewport(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
-    GLES.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    GLES.glClear(GL_COLOR_BUFFER_BIT);
 
     GLES.glUseProgram(FSR1_Context::g_fsrProgram);
 
@@ -446,26 +498,80 @@ void ApplyFSR() {
     // uInputTex was pointed at when the program was linked.
     GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_renderTexture);
 
-    // Plain arrays rather than a vector type from a maths library: these two are
-    // handed straight to glUniform*fv, and nothing is ever computed with them.
-    const GLfloat const0[4] = {float(FSR1_Context::g_renderWidth) / FSR1_Context::g_targetWidth,
-                               float(FSR1_Context::g_renderHeight) / FSR1_Context::g_targetHeight,
-                               1.0f / FSR1_Context::g_targetWidth,
-                               1.0f / FSR1_Context::g_targetHeight};
-
-    GLES.glUniform4fv(FSR1_Context::g_const0Loc, 1, const0);
-
+    // Task 80 (Amethyst fork): the EASU constant setup runs in the shader from
+    // these two uniforms -- the input (render) size and the upscale output
+    // (target) size. Upstream fed a vec4 nobody read (uConst0) and computed the
+    // constants with outputSize == inputSize, an identity mapping.
     const GLfloat viewportSize[2] = {(float)FSR1_Context::g_renderWidth,
                                      (float)FSR1_Context::g_renderHeight};
     GLES.glUniform2fv(FSR1_Context::g_viewportSizeLoc, 1, viewportSize);
 
+    const GLfloat targetSize[2] = {(float)FSR1_Context::g_targetWidth,
+                                   (float)FSR1_Context::g_targetHeight};
+    GLES.glUniform2fv(FSR1_Context::g_targetSizeLoc, 1, targetSize);
+
     GLES.glBindVertexArray(FSR1_Context::g_quadVAO);
+
+    // Task 83 (Amethyst fork) per-frame cost reduction: 3 fullscreen passes -> 1.
+    // The old body paid (a) a clear of the target, (b) the EASU draw, (c) a
+    // full-surface blit -- every frame. (a) was pure waste: the EASU quad
+    // covers the whole target, so the clear only ever survived into a frame
+    // when the pass itself had already failed. (c) is unnecessary whenever the
+    // target matches the surface: draw EASU straight into the surface and skip
+    // the intermediate target FBO entirely. That match is arranged on the
+    // resize path (rounding residue of at most a few pixels is clamped up to
+    // the surface), so the common launcher case runs one fullscreen pass; the
+    // resolution-slider-stacked path (target genuinely below the surface)
+    // keeps the old blit so the linear filter performs that final stretch.
+    const bool directToSurface =
+        FSR1_Context::g_surfaceWidth > 0 && FSR1_Context::g_surfaceHeight > 0 &&
+        FSR1_Context::g_targetWidth == FSR1_Context::g_surfaceWidth &&
+        FSR1_Context::g_targetHeight == FSR1_Context::g_surfaceHeight;
+
+    if (directToSurface) {
+        // Depth/scissor/blend/cull would all silently eat the quad on a default
+        // framebuffer that carries a depth attachment or app-leftover state --
+        // the target FBO never had those, the surface may. MC re-arms its own
+        // state every frame, so leaving these disabled through the swap is the
+        // same stomp the rest of this function already makes.
+        GLES.glDisable(GL_DEPTH_TEST);
+        GLES.glDisable(GL_SCISSOR_TEST);
+        GLES.glDisable(GL_BLEND);
+        GLES.glDisable(GL_CULL_FACE);
+        GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        GLES.glViewport(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
+        GLES.glDrawArrays(GL_TRIANGLES, 0, 6);
+        // Hand the draw binding back to the render FBO the application's next
+        // frame expects (the guard would restore it too, but the read binding
+        // below is cheap to leave untouched and the explicit bind documents
+        // the handoff).
+        GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FSR1_Context::g_renderFBO);
+        GLES.glViewport(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
+        return;
+    }
+
+    GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_targetFBO);
+    GLES.glViewport(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
+
     GLES.glDrawArrays(GL_TRIANGLES, 0, 6);
 
     GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, FSR1_Context::g_targetFBO);
     GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    // Task 80 (Amethyst fork): blit the target into the FULL SURFACE, not a
+    // target-sized corner of it. The preset scale rounds (render 1814 * 1.30 =
+    // 2358 vs surface 2360), the resolution slider can stack with FSR (target
+    // well below surface), and a rotation can change the surface out from under
+    // a still-valid render size -- a 1:1 blit left a stale right-hand column in
+    // every one of those. GL_LINEAR on the blit handles the residual stretch
+    // (an exact copy when the sizes match). Before the first
+    // CheckResolutionChange the surface size is unknown; fall back to 1:1 on
+    // the target for that single frame.
+    const GLsizei dstW = (FSR1_Context::g_surfaceWidth > 0) ? FSR1_Context::g_surfaceWidth
+                                                            : FSR1_Context::g_targetWidth;
+    const GLsizei dstH = (FSR1_Context::g_surfaceHeight > 0) ? FSR1_Context::g_surfaceHeight
+                                                             : FSR1_Context::g_targetHeight;
     GLES.glBlitFramebuffer(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, 0, 0,
-                           FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                           dstW, dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
     // The viewport and nothing else. Neither framebuffer binding is worth setting
     // here: the guard restores both on the next line, and what it restores for the
@@ -496,7 +602,29 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
     // reach the driver's command stream.
     egl_eglQuerySurface(display, surface, EGL_WIDTH, &width);
     egl_eglQuerySurface(display, surface, EGL_HEIGHT, &height);
-    OnResize(width, height);
+    // Task 78 (Amethyst fork): the render size follows the APPLICATION, not the
+    // surface. Upstream fed the surface dims into OnResize here unconditionally,
+    // which pinned render == surface by construction -- in any launcher that
+    // tells Minecraft its window equals the surface, the upscale was dead on
+    // arrival (Task 76's zero-gain teardown, and before it a double resample).
+    // With the launcher's FSR linkage MC's told window -- and therefore its
+    // glViewport latch -- IS the render size, and the target below lands on the
+    // surface. The surface feed survives only as a pre-first-viewport fallback
+    // (pending == 0): a fullscreen-viewport application then settles on
+    // render == surface -> zero-gain teardown -> direct present, which is the
+    // correct verdict for it.
+    if (FSR1_Context::g_pendingWidth == 0 && FSR1_Context::g_pendingHeight == 0) {
+        OnResize(width, height);
+    }
+    // Task 76 (Amethyst fork): keep the surface size visible to the zero-gain
+    // branch below under names that cannot be shadowed by the pending-size pair.
+    const GLsizei surfaceWidth = width;
+    const GLsizei surfaceHeight = height;
+    // Task 80 (Amethyst fork): remember the surface for ApplyFSR's full-bleed
+    // blit. One frame behind the swap it will present into (this runs after
+    // it), which is exactly the freshness the old per-frame code had too.
+    FSR1_Context::g_surfaceWidth = surfaceWidth;
+    FSR1_Context::g_surfaceHeight = surfaceHeight;
 
     if (FSR1_Context::g_resolutionChanged) {
         FSR1_Context::g_resolutionChanged = false;
@@ -508,7 +636,86 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
         CalculateTargetResolution(global_settings.fsr1_setting, width, height,
                                   reinterpret_cast<int*>(&FSR1_Context::g_targetWidth),
                                   reinterpret_cast<int*>(&FSR1_Context::g_targetHeight));
-        RecreateFSRFBO();
+        // Task 80 (Amethyst fork): clamp the target to the surface when the
+        // preset scale would overshoot it. render x scale lands a pixel or two
+        // past the surface purely from rounding (1814 x 1.30 = 2358.2 on a
+        // 2360-wide surface -- and the launcher derived 1814 FROM 2360), so
+        // an unclamped target allocates an oversized FBO and still cannot
+        // fill the last column. A target genuinely below the surface (the
+        // resolution slider stacked on FSR) is left alone: the blit's linear
+        // filter performs that final stretch by design.
+        if (surfaceWidth > 0 && FSR1_Context::g_targetWidth > surfaceWidth) {
+            FSR1_Context::g_targetWidth = surfaceWidth;
+        }
+        if (surfaceHeight > 0 && FSR1_Context::g_targetHeight > surfaceHeight) {
+            FSR1_Context::g_targetHeight = surfaceHeight;
+        }
+        // Task 83 (Amethyst fork): round the target UP to the surface when the
+        // gap is pure rounding residue (<= 4 px per axis). render x preset
+        // regularly lands 1-2 px short of the surface it was derived from
+        // (2360 / 1.5 = 1573.3 -> 1573; 1573 x 1.5 = 2359.5 -> 2359 on a
+        // 2360 surface). A residue-sized gap buys nothing -- the blit's linear
+        // filter stretches those two columns invisibly -- while an exact match
+        // lets ApplyFSR take the direct-to-surface path and skip the blit and
+        // the intermediate target entirely (one fullscreen pass per frame
+        // instead of three). Anything larger than residue is a genuine
+        // sub-surface target (resolution slider stacked on FSR) and keeps the
+        // blit path.
+        if (surfaceWidth > 0 && surfaceWidth - FSR1_Context::g_targetWidth <= 4) {
+            FSR1_Context::g_targetWidth = surfaceWidth;
+        }
+        if (surfaceHeight > 0 && surfaceHeight - FSR1_Context::g_targetHeight <= 4) {
+            FSR1_Context::g_targetHeight = surfaceHeight;
+        }
+        // Task 76 (Amethyst fork): zero-gain bypass. The outer width/height hold
+        // the surface size from this swap's eglQuerySurface pair; the local pair
+        // shadow them with the pending render size. When the latched render size
+        // covers the surface, an upscale pass can only resample twice at up to
+        // scale^2 the surface area -- tear down instead of recreating. A future
+        // surface that outgrows the render size (window resize up, rotation into
+        // a larger surface) re-arms the machinery through RecreateFSRFBO, but a
+        // render size that only ever follows the viewport back up re-tears it.
+        if (width >= surfaceWidth && height >= surfaceHeight) {
+            TeardownFSR1();
+        } else if (FSR1_Context::g_fsrProgram == 0) {
+            // Task 80 (Amethyst fork): never engage with a dead program -- the
+            // geometry says "upscale" but the pass would clear the target to
+            // black and draw nothing (see InitFSRResources' safety net for the
+            // full failure chain). Unreachable by construction (the init path
+            // creates no FBOs without a program); the teardown is a no-op then
+            // and stays one -- it only bites if some future path arms the FBOs
+            // without a working pass.
+            TeardownFSR1();
+            static bool s_task80_deadprog = false;
+            if (!s_task80_deadprog) {
+                s_task80_deadprog = true;
+                LOG_W_FORCE("[MG] FSR1 upscale NOT engaged: shader program unavailable -- presenting directly (no upscale this session)");
+            }
+        } else {
+            // Task 78 (Amethyst fork): one-shot engage log. This branch is the
+            // first time the upscale is actually live under the launcher's
+            // FSR linkage -- render (viewport latch) below the surface, target
+            // = render x preset scale on top of the surface.
+            static bool s_task78_engaged = false;
+            if (!s_task78_engaged) {
+                s_task78_engaged = true;
+                LOG_W_FORCE("[MG] FSR1 upscale engaged (Task78): render %dx%d -> target %dx%d -> surface %dx%d (viewport-latched render, launcher FSR linkage)",
+                            FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight,
+                            FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight,
+                            surfaceWidth, surfaceHeight);
+            }
+            RecreateFSRFBO();
+        }
+    } else if (FSR1_Context::g_renderFBO != 0 && FSR1_Context::g_renderWidth > 0 &&
+               FSR1_Context::g_renderWidth >= surfaceWidth && FSR1_Context::g_renderHeight >= surfaceHeight) {
+        // Task 78 (Amethyst fork) safety: zero-gain verdict without a pending
+        // change. Reachable when the preset is on but the linkage is inactive
+        // (MC told the full window: the viewport latch equals the surface, or
+        // a legacy init adopted the surface through the fallback feed above).
+        // Without this the oversized target kept paying the triple fullscreen
+        // tax every frame -- exactly the state Task 76 tore down, resurrected
+        // by the init-adoption path.
+        TeardownFSR1();
     }
     // No glViewport here. This runs immediately after ApplyFSR and the swap, and
     // ApplyFSR ends every frame with exactly this call at exactly this size; on the
@@ -525,14 +732,173 @@ void OnResize(int width, int height) {
     FSR1_Context::g_resolutionChanged = true;
 }
 
+// Task 76 (Amethyst fork): tear the FSR1 machinery down for this context.
+//
+// FSR1 exists to upscale a LOW render resolution up to the surface size. The
+// application (Minecraft with a fullscreen window) drives its first
+// glViewport at the full window size, the glViewport hook below latches that
+// as the render size, and the render size lands equal to (or above) the EGL
+// surface. From that moment the upscale has nothing to offer:
+//
+//   - the target is render * scale (3540x2460 for a 2360x1640 surface at the
+//     Quality preset, 2.25x the surface's pixel count);
+//   - ApplyFSR pays a fullscreen clear + the EASU/RCAS pass into that oversized
+//     target every frame;
+//   - the closing blit then scales BACK DOWN to the surface, so the presented
+//     image went render -> upscale -> downscale: three fullscreen passes and
+//     a double resample, for image quality strictly WORSE than presenting the
+//     render texture directly, on top of the frame-time cost.
+//
+// Zero gain is detected once the geometry is latched (CheckResolutionChange)
+// and resolved by deleting the render/target objects and zeroing g_renderFBO.
+// gl/framebuffer.cpp keys its framebuffer-0 redirect on g_renderFBO != 0, so
+// the teardown also reverts the application to drawing straight into the
+// surface, and ApplyFSR's guard above makes the per-swap call a no-op.
+// fsrInitialized is deliberately left true so glCreateShader does not rebuild
+// this machinery for a state already judged zero-gain. Per-context state is
+// consistent: mg_fsr1_bind_context stores/loads these globals verbatim, so a
+// torn-down context stays torn down across binds.
+void TeardownFSR1() {
+    if (FSR1_Context::g_renderFBO == 0 && FSR1_Context::g_targetFBO == 0) return;
+    GLStateGuard state(GUARD_FRAMEBUFFER | GUARD_TEXTURE);
+
+    const GLuint deadRenderFBO = FSR1_Context::g_renderFBO;
+    const GLuint deadTargetFBO = FSR1_Context::g_targetFBO;
+    const GLuint deadRenderTex = FSR1_Context::g_renderTexture;
+    const GLuint deadTargetTex = FSR1_Context::g_targetTexture;
+    const GLuint deadRBO = FSR1_Context::g_depthStencilRBO;
+
+    // gl/framebuffer.cpp owns gl_state->current_draw_fbo. If the tracked draw
+    // binding points at a name that is about to die, repoint it at 0 (the real
+    // surface) by hand, and tell any live GLStateGuard that saved one of the
+    // dead names to restore 0 instead -- restoring a deleted name is rejected
+    // and leaves the binding wherever the body left it (the exact failure mode
+    // RecreateFSRFBO's framebuffer_recreated bookkeeping exists to prevent).
+    if (gl_state->current_draw_fbo == deadRenderFBO || gl_state->current_draw_fbo == deadTargetFBO) {
+        set_gl_state_current_draw_fbo(0);
+    }
+    state.framebuffer_recreated(deadRenderFBO, 0);
+    state.framebuffer_recreated(deadTargetFBO, 0);
+
+    GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    GLES.glDeleteFramebuffers(1, &deadRenderFBO);
+    GLES.glDeleteFramebuffers(1, &deadTargetFBO);
+    GLES.glDeleteTextures(1, &deadRenderTex);
+    GLES.glDeleteTextures(1, &deadTargetTex);
+    GLES.glDeleteRenderbuffers(1, &deadRBO);
+
+    FSR1_Context::g_renderFBO = 0;
+    FSR1_Context::g_renderTexture = 0;
+    FSR1_Context::g_targetFBO = 0;
+    FSR1_Context::g_targetTexture = 0;
+    FSR1_Context::g_depthStencilRBO = 0;
+
+    LOG_W_FORCE("[MG] FSR1 zero-gain bypass: render %dx%d >= surface -- FSR machinery torn down, frames presented directly (preset kept for a future sub-surface render size)",
+                FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
+}
+
+// Task 82 (Amethyst fork): the surface size as seen by this context's last
+// CheckResolutionChange, or -- before the first swap -- straight from EGL.
+// The glViewport latch below needs it to tell a window viewport from an
+// intermediate render pass, and the poisoning it exists to stop happens
+// exactly in the pre-first-swap window where the cache is still empty.
+static void task82_surface_size(GLsizei* outW, GLsizei* outH) {
+    if (FSR1_Context::g_surfaceWidth > 0 && FSR1_Context::g_surfaceHeight > 0) {
+        *outW = FSR1_Context::g_surfaceWidth;
+        *outH = FSR1_Context::g_surfaceHeight;
+        return;
+    }
+    // Same fallback CheckResolutionChange uses. eglGetCurrentDisplay /
+    // eglGetCurrentSurface are this image's own frontend exports (egl/egl.cpp),
+    // and eglQuerySurface reads attributes the surface record already holds --
+    // no driver round trip, no command-stream interaction.
+    EGLDisplay display = eglGetCurrentDisplay();
+    EGLSurface surface = eglGetCurrentSurface(EGL_DRAW);
+    if (display == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) {
+        *outW = 0;
+        *outH = 0;
+        return;
+    }
+    LOAD_EGL(eglQuerySurface);
+    if (egl_eglQuerySurface == NULL) {
+        *outW = 0;
+        *outH = 0;
+        return;
+    }
+    EGLint w = 0, h = 0;
+    egl_eglQuerySurface(display, surface, EGL_WIDTH, &w);
+    egl_eglQuerySurface(display, surface, EGL_HEIGHT, &h);
+    *outW = w;
+    *outH = h;
+}
+
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
     LOG()
     LOG_D("glViewport: x=%d, y=%d, w=%d, h=%d", x, y, w, h);
 
     if (w > FSR1_Context::g_pendingWidth || h > FSR1_Context::g_pendingHeight) {
-        FSR1_Context::g_pendingWidth = w;
-        FSR1_Context::g_pendingHeight = h;
-        FSR1_Context::g_resolutionChanged = true;
+        // Task 82 (Amethyst fork): the latch only ever grows, so any
+        // intermediate render pass with a viewport larger than the window's
+        // poisons it for good. MC 26.x renders animated atlas sprites into
+        // the blocks atlas through a glViewport of the full atlas size --
+        // 2048x2048 on a 2360x1640 surface whose window (surface / preset
+        // scale) is 1814x1262. The atlas latch won (2048 > 1814), the main
+        // viewport could never reclaim it (nothing grows past 2048), and the
+        // upscale then stretched the mostly-unwritten 2048x2048 render
+        // texture over the whole surface: the game appeared shrunk into the
+        // bottom-left corner (ea27def: "render 2048x2048 -> target
+        // 2360x1640" while every swap probe showed the real frame viewport
+        // at 1814x1262).
+        //
+        // Two properties separate a window viewport from an intermediate
+        // pass, and a latch candidate has to pass both:
+        //   1. it never exceeds the EGL surface -- the window IS at most the
+        //      surface, the launcher derives it as surface / preset scale;
+        //   2. it carries the surface's aspect ratio -- the window scales the
+        //      surface uniformly, while atlas and shadow-map passes are
+        //      square and post-processing targets are window-shaped and no
+        //      larger. 3% absorbs the preset-scale rounding (1814/1262 =
+        //      1.4371 vs 2360/1640 = 1.4390, a 0.13% drift).
+        // Candidates failing either are refused; the growth rule stays for
+        // the ones that pass, so a rotation (a dimension swap is still a
+        // growth in one axis) keeps re-latching as before. Checked only
+        // while FSR1 is enabled -- with the preset off nothing consumes the
+        // latch and the EGL queries would be pure overhead.
+        bool latch = true;
+        if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled) {
+            GLsizei surfaceW = 0, surfaceH = 0;
+            task82_surface_size(&surfaceW, &surfaceH);
+            if (surfaceW > 0 && surfaceH > 0) {
+                if (w > surfaceW || h > surfaceH) {
+                    latch = false;
+                } else {
+                    const float surfaceAspect = (float)surfaceW / (float)surfaceH;
+                    const float vpAspect = (float)w / (float)h;
+                    const float drift =
+                        (vpAspect > surfaceAspect ? vpAspect - surfaceAspect : surfaceAspect - vpAspect) /
+                        surfaceAspect;
+                    if (drift > 0.03f) latch = false;
+                }
+                if (!latch) {
+                    // Once per distinct rejected size: the atlas pass fires
+                    // every frame, and the first refusal is the whole story.
+                    static GLsizei s_task82_rejW = -1;
+                    static GLsizei s_task82_rejH = -1;
+                    if (s_task82_rejW != w || s_task82_rejH != h) {
+                        s_task82_rejW = w;
+                        s_task82_rejH = h;
+                        LOG_W_FORCE("[MG] FSR1 viewport latch rejected (Task 82): %dx%d is not a window viewport "
+                                    "(surface %dx%d) -- intermediate render pass kept out of the upscale geometry",
+                                    w, h, surfaceW, surfaceH);
+                    }
+                }
+            }
+        }
+        if (latch) {
+            FSR1_Context::g_pendingWidth = w;
+            FSR1_Context::g_pendingHeight = h;
+            FSR1_Context::g_resolutionChanged = true;
+        }
     }
 
     GLES.glViewport(x, y, w, h);
@@ -547,9 +913,12 @@ struct fsr1_ctx_state_t {
     GLuint quadVAO = 0, quadVBO = 0, fsrProgram = 0;
     // Locations belong to fsrProgram, so they travel with it rather than being
     // re-resolved after a context switch.
-    GLint inputTexLoc = -1, const0Loc = -1, viewportSizeLoc = -1;
+    GLint inputTexLoc = -1, targetSizeLoc = -1, viewportSizeLoc = -1;
     GLuint targetFBO = 0, targetTexture = 0, currentDrawFBO = 0;
     GLsizei targetWidth = 0, targetHeight = 0, renderWidth = 0, renderHeight = 0;
+    // Task 80 (Amethyst fork): surface geometry is per-context state -- a second
+    // context presents to its own surface.
+    GLsizei surfaceWidth = 0, surfaceHeight = 0;
     bool initialised = false;
 };
 
@@ -570,7 +939,7 @@ void store_into(fsr1_ctx_state_t& d) {
     d.quadVBO = FSR1_Context::g_quadVBO;
     d.fsrProgram = FSR1_Context::g_fsrProgram;
     d.inputTexLoc = FSR1_Context::g_inputTexLoc;
-    d.const0Loc = FSR1_Context::g_const0Loc;
+    d.targetSizeLoc = FSR1_Context::g_targetSizeLoc;
     d.viewportSizeLoc = FSR1_Context::g_viewportSizeLoc;
     d.targetFBO = FSR1_Context::g_targetFBO;
     d.targetTexture = FSR1_Context::g_targetTexture;
@@ -579,6 +948,8 @@ void store_into(fsr1_ctx_state_t& d) {
     d.targetHeight = FSR1_Context::g_targetHeight;
     d.renderWidth = FSR1_Context::g_renderWidth;
     d.renderHeight = FSR1_Context::g_renderHeight;
+    d.surfaceWidth = FSR1_Context::g_surfaceWidth;
+    d.surfaceHeight = FSR1_Context::g_surfaceHeight;
     d.initialised = fsrInitialized;
 }
 
@@ -590,7 +961,7 @@ void load_from(const fsr1_ctx_state_t& s) {
     FSR1_Context::g_quadVBO = s.quadVBO;
     FSR1_Context::g_fsrProgram = s.fsrProgram;
     FSR1_Context::g_inputTexLoc = s.inputTexLoc;
-    FSR1_Context::g_const0Loc = s.const0Loc;
+    FSR1_Context::g_targetSizeLoc = s.targetSizeLoc;
     FSR1_Context::g_viewportSizeLoc = s.viewportSizeLoc;
     FSR1_Context::g_targetFBO = s.targetFBO;
     FSR1_Context::g_targetTexture = s.targetTexture;
@@ -599,6 +970,8 @@ void load_from(const fsr1_ctx_state_t& s) {
     FSR1_Context::g_targetHeight = s.targetHeight;
     FSR1_Context::g_renderWidth = s.renderWidth;
     FSR1_Context::g_renderHeight = s.renderHeight;
+    FSR1_Context::g_surfaceWidth = s.surfaceWidth;
+    FSR1_Context::g_surfaceHeight = s.surfaceHeight;
     fsrInitialized = s.initialised;
     // Left alone deliberately: g_dirty, g_resolutionChanged and the pending size
     // describe work queued for the frame in flight, not the context's objects.

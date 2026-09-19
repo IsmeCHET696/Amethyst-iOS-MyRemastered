@@ -277,7 +277,14 @@
 // entries written by <= 2.0.16 embed the corrupted ESSL and would keep being
 // re-served for identical sources. "MobileGlues 2.0.17" in the runtime
 // Graphics Drivers line identifies the fixed build on device.
-#define REVISION 1
+// REVISION 1 -> 17: 与参考仓库 Air 的 MobileGlues-cpp（2.0.17 Release）对齐。
+// 本仓库 src/main/cpp 的源码内容与 2.0.17 一致（逐文件比对仅 9 个文件不同，
+// 其中 2 个是本次同步过来的 Air Task78/Task81，3 个是 FSR1，1 个 CMakeLists，
+// 2 个是本仓库刻意保留的本地改动，1 个就是本文件），但 REVISION 宏停在 1，
+// 于是设备日志显示 "MobileGlues 2.0.1 Dev1"、且磁盘上的 GLSL 转换缓存键
+// （内嵌 MAJOR.MINOR.REVISION）与参考仓库不同。此处对齐到 17：既让版本号如实
+// 反映源码水平，也强制失效旧转换缓存，避免旧构建写下的 ESSL 被反复命中。
+#define REVISION 17
 #define PATCH 0
 
 #define VERSION_TYPE VERSION_DEVELOPMENT

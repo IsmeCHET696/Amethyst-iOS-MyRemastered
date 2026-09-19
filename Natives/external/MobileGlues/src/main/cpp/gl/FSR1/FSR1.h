@@ -38,7 +38,10 @@ namespace FSR1_Context {
     // as long as it lives. -1 for a name the linker dropped, which glUniform*
     // ignores.
     extern GLint g_inputTexLoc;
-    extern GLint g_const0Loc;
+    // Task 80 (Amethyst fork): uTargetSize (vec2) replaces upstream's uConst0
+    // (vec4, declared but never read by the shader) -- the EASU constant setup
+    // needs the upscale output size.
+    extern GLint g_targetSizeLoc;
     extern GLint g_viewportSizeLoc;
 
     extern GLuint g_targetFBO;
@@ -50,6 +53,10 @@ namespace FSR1_Context {
     extern GLsizei g_targetHeight;
     extern GLsizei g_renderWidth;
     extern GLsizei g_renderHeight;
+    // Task 80 (Amethyst fork): the surface size as last seen by
+    // CheckResolutionChange; ApplyFSR blits the target to the full surface.
+    extern GLsizei g_surfaceWidth;
+    extern GLsizei g_surfaceHeight;
     extern bool g_dirty;
 
     extern bool g_resolutionChanged;
@@ -69,8 +76,19 @@ extern bool fsrInitialized;
 void mg_fsr1_bind_context(unsigned long long ctx_id);
 void ApplyFSR();
 void InitFSRResources();
+// Task 78 (Amethyst fork): the render size follows the application's viewport
+// (the glViewport hook latch), not the surface -- the surface dims are only fed
+// in before any viewport was latched (pending == 0). The launcher's FSR linkage
+// tells MC its window is surface/fsr_scale, so the latch IS the render size and
+// the target (render x preset scale) lands on the surface.
 void CheckResolutionChange(EGLDisplay display, EGLSurface surface);
 void OnResize(int width, int height);
+// Task 76 (Amethyst fork): delete the FSR1 render/target objects and zero
+// g_renderFBO for a context whose latched render size covers the surface --
+// the upscale has nothing to offer there, only a double resample and up to
+// scale^2 the surface area in extra fullscreen bandwidth per frame. See the
+// block comment on the definition in FSR1.cpp before touching it.
+void TeardownFSR1();
 
 extern "C"
 {
