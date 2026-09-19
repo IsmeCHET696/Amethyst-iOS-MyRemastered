@@ -343,30 +343,6 @@ int main(int argc, char *argv[]) {
     isJailbroken = init_checkForJailbreak();
     init_setupHomeDirectory();
     init_redirectStdio();
-    // Air Task 43：在此 fork shaderc 编译服务器（不 exec）。位置选择的三个理由：
-    //   1) stderr 已接 latestlog 管道——子进程取证（sb_clog raw write）直接
-    //      经管道落 latestlog.txt（父进程的日志读取线程活着，跨进程收走）；
-    //   2) 进程此刻只有主线程 + 日志读取线程（read() 阻塞中，不持 malloc/
-    //      stdio/dyld 锁）——子进程可安全 dlopen impl + malloc；
-    //   3) JVM/JIT/hook/ANGLE 均未诞生——进程内堆踩踏的“外部写入者”在子
-    //      进程地址空间里从未运行，编译环境天然纯净。
-    // 缺此调用时：沙箱只有 posix_spawn 一条拉起路径，而沙盒安装上 posix_spawn
-    // 恒 EPERM（见 sb_spawn 注释），首次 shader 缓存 MISS 就会降级到进程内
-    // 编译（glslang 崩溃无任何兜底）→ 进世界即闪退。
-    // 符号在 libshaderc.dylib 垫片里（Makefile 编入 shaderc_sandbox.m），
-    // 故用 dlsym 解析，避免主可执行文件链接期依赖。
-    {
-        void *sbh = dlopen("@rpath/libshaderc.dylib", RTLD_NOW);
-        if (!sbh) sbh = dlopen("libshaderc.dylib", RTLD_NOW);
-        if (sbh) {
-            int (*sb_fork_server)(void) = dlsym(sbh, "ame_sb_fork_server_early");
-            if (sb_fork_server) {
-                sb_fork_server();
-            } else {
-                fprintf(stderr, "[shaderc-sandbox] fork server symbol unavailable\n");
-            }
-        }
-    }
     init_logDeviceAndVer(argv[0]);
 
     loadPreferences(NO);

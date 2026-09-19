@@ -1211,12 +1211,31 @@ static void *ame_shaderc_shim_compile(const char *sym, void *compiler,
     // LWJGL Checks.check 对 NULL 抛 NPE，真机 CompletionException 的直接死因）；
     // 诊断链不丢失。
     ame_crash_net_install();
-    void *result = ame_call_real_guarded((ame_shaderc_shim_compile_fn_t)real, live_compiler,
-                                         source, source_size, kind, input_file,
-                                         entry_point, options);
-    // Task 44：首后所有尝试换新鲜线程（见上方 ame_attempt_on_fresh_thread）；
-    // crashed 标志經 job 结构侧信道传递（__thread 在尝试线程上）。
-    int attempt_crashed = ame_last_call_crashed;
+    // Task 108：沙箱不可用（iOS 禁 fork/posix_spawn，启动日志
+    // "[shaderc-sandbox] fork() failed errno=1"）时，首次尝试也必须跑在
+    // 32MB 新鲜线程上——崩溃网（Task 44）已去掉 SA_ONSTACK，注释里
+    // “编译线程本身已是 32MB 栈，信号帧绰绰有余”的前提只对 fresh thread
+    // 成立。若首次在渲染线程（默认栈）编译并爆栈，信号帧无处安放会二次
+    // SIGSEGV，整机被带走且不留 Java 崩溃报告（正是现象：日志戛然而止）。
+    int attempt_crashed = 0;
+    void *result = NULL;
+    if (!ame_sandbox_active()) {
+        result = ame_attempt_on_fresh_thread((ame_shaderc_shim_compile_fn_t)real,
+                                             live_compiler, source, source_size, kind,
+                                             input_file, entry_point, options,
+                                             &attempt_crashed);
+        if (attempt_crashed) {
+            fprintf(stderr,
+                    "[shaderc-shim] compile#%d crashed on 32MB first attempt "
+                    "(sandbox disabled) -- retrying on FRESH THREAD (Task 108)\n",
+                    seq);
+        }
+    } else {
+        result = ame_call_real_guarded((ame_shaderc_shim_compile_fn_t)real, live_compiler,
+                                       source, source_size, kind, input_file,
+                                       entry_point, options);
+        attempt_crashed = ame_last_call_crashed;
+    }
     if (attempt_crashed) {
         fprintf(stderr,
                 "[shaderc-shim] compile#%d crashed on first attempt -- retrying on a "
