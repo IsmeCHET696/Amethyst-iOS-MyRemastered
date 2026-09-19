@@ -327,6 +327,27 @@ jre: native
 dep_mg:
 	echo '[Amethyst v$(VERSION)] dep_mg - start'
 	mkdir -p $(WORKINGDIR)/mobileglues
+	# MG 自带 3rdparty/glslang（CMakeLists 里 add_subdirectory 从源码构建）。参考仓库在 cmake
+	# 配置前对这份 glslang 打两个防护补丁（本仓库该目录是 vendored 而非 submodule，故用
+	# --directory 定位）：
+	#   * glslang-lvalue-nullguard.patch —— TParseContext::lValueErrorCheck 取 swizzle
+	#     选择器聚合前不判空；iOS/arm64 上解析 MC 26.x 的 position_color 顶点着色器时该链
+	#     SIGSEGV，启动/资源重载阶段直接杀进程（无 .ips、无 hs_err，表现为静默闪退）。
+	#   * glslang-pool-zero-and-size-guards.patch —— GlslangToSpv::convertSwizzle 的
+	#     constArray 尺寸判，必须打在 nullguard 之上。
+	# 幂等：先 --check 正向，失败再 --check 反向（判定已打过），两种情况都继续构建。
+	@mg_glrel=Natives/external/MobileGlues/src/main/cpp/3rdparty/glslang; \
+	mg_gldir=$(SOURCEDIR)/$$mg_glrel; \
+	for p in glslang-lvalue-nullguard.patch glslang-pool-zero-and-size-guards.patch; do \
+		if [ ! -f "$$mg_gldir/$$p" ]; then echo "[dep_mg] glslang patch $$p missing - skip"; continue; fi; \
+		if git -C $(SOURCEDIR) apply --check -p1 --directory=$$mg_glrel "$$mg_gldir/$$p" >/dev/null 2>&1; then \
+			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_gldir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || echo "[dep_mg] WARNING: $$p apply failed"; \
+		elif git -C $(SOURCEDIR) apply --check -R -p1 --directory=$$mg_glrel "$$mg_gldir/$$p" >/dev/null 2>&1; then \
+			echo "[dep_mg] glslang patch $$p already applied"; \
+		else \
+			echo "[dep_mg] WARNING: $$p neither applies nor is applied -- MG glslang left UNPATCHED"; \
+		fi; \
+	done
 	# CMAKE_BUILD_TYPE 必须显式给出：--config 对单配置生成器无效。缺失时 CMake 不追加
 	# -O2/-DNDEBUG，整库 -O0 且 glslang/SPIRV-Cross/MG 的 assert() 全部激活 —— assert
 	# 触发即 __assert_rtn->abort()，表现为直接进启动器错误界面且无 .ips/hs_err。
