@@ -47,7 +47,7 @@ static const CGFloat kDragThreshold = 10.0;
         self.userInteractionEnabled = YES;
         // 默认显示 FPS/内存标签（可通过菜单开关）
         _statsLabelVisible = YES;
-        _overlayHidden = NO;
+        _overlayHidden = YES;
 
         // 从偏好加载 FPS/内存显示开关状态
         NSNumber *savedVisible = getPrefObject(kPrefStatsLabelVisible);
@@ -55,7 +55,7 @@ static const CGFloat kDragThreshold = 10.0;
             _statsLabelVisible = [savedVisible boolValue];
         }
 
-        [self setupMenuButton];
+        // [self setupMenuButton];
         [self setupStatsLabel];
         [parentView addSubview:self];
 
@@ -66,7 +66,7 @@ static const CGFloat kDragThreshold = 10.0;
 }
 
 - (void)setupMenuButton {
-    self.menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    // self.menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.menuButton.frame = CGRectMake(0, 0, kMenuButtonSize, kMenuButtonSize);
     self.menuButton.layer.cornerRadius = kMenuButtonSize / 2;
     // 半透明深色背景，确保在游戏画面上可见
@@ -76,7 +76,7 @@ static const CGFloat kDragThreshold = 10.0;
     // 参照 FCL：使用设置图标（gearshape）
     UIImage *icon = [UIImage systemImageNamed:@"gearshape.fill"]
                     ?: [UIImage systemImageNamed:@"gear"];
-    [self.menuButton setImage:icon forState:UIControlStateNormal];
+    // [self.menuButton setImage:icon forState:UIControlStateNormal];
     self.menuButton.tintColor = [UIColor whiteColor];
     // 使用纯 frame 布局（不用 auto layout），因为按钮位置通过 center 手动设置并持久化
     // 不设置 translatesAutoresizingMaskIntoConstraints = NO，保持默认 YES，避免无约束导致 frame 不确定
@@ -89,10 +89,10 @@ static const CGFloat kDragThreshold = 10.0;
     [self.menuButton addGestureRecognizer:pan];
 
     // 点击事件
-    [self.menuButton addTarget:self action:@selector(menuButtonTouchedDown:) forControlEvents:UIControlEventTouchDown];
-    [self.menuButton addTarget:self action:@selector(menuButtonTouchedUp:) forControlEvents:UIControlEventTouchUpInside];
+   // [self.menuButton addTarget:self action:@selector(menuButtonTouchedDown:) forControlEvents:UIControlEventTouchDown];
+  //  [self.menuButton addTarget:self action:@selector(menuButtonTouchedUp:) forControlEvents:UIControlEventTouchUpInside];
 
-    [self addSubview:self.menuButton];
+   // [self addSubview:self.menuButton];
 }
 
 - (void)setupStatsLabel {
