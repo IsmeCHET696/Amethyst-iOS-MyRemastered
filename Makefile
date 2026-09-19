@@ -431,6 +431,46 @@ dep_shader_shims: dep_mg
 		-Wl,-reexport_library,$(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib \
 		-o $(WORKINGDIR)/libspirv-cross-c-shared.0.dylib \
 		$(SOURCEDIR)/Natives/spvc_shim.c || exit 1
+	# -------------------------------------------------------------------
+	# MobileGlues 的 SPIRV-Cross 与上面的 LWJGL spvc 垫片解耦
+	#
+	# MG 在 CMakeLists 里链接 libraries/ios/ 下预编译的 libspirv-cross-c-shared.dylib，
+	# 其 LC_ID_DYLIB 与上面产出的 spvc 垫片同名。于是运行时 dyld 把 MG 的每一次
+	# spvc_* 调用都解析进垫片 —— 即 32MB 栈派发线程 + 进程级主编译锁（日志里
+	# "[spvc-shim] ... MG serialization ON" 就是它）。MC 26.3 的 shader 转换量远大于
+	# 26.2，这条共享路径被压满后进程被拖死：静默闪退、无 hs_err、无崩溃报告；
+	# 26.2 量小所以不受影响。（MG 自身跑得完转换 —— 垫片之前 26.3 + MG 是有声音的，
+	# 只是黑屏。）
+	#
+	# 参考仓库 Air 的 MG 走 add_subdirectory(3rdparty/SPIRV-Cross) 并静态链接
+	# spirv-cross-c，根本不存在这份共享库，因此不受影响。本仓库未纳入 SPIRV-Cross
+	# submodule，故不改 MG 的链接方式，只在打包前把 libmobileglues 对 spirv-cross
+	# 的依赖重定向到一份独立命名的真库；LWJGL 侧仍按原名加载垫片，32MB 栈与
+	# 串行锁保护原样保留，行为完全不变。
+	#
+	# 依赖名由 otool 现场探测、不写死；源库按两条候选路径查找。任一环节缺失都只
+	# 打印 WARN 并跳过，不会让构建失败。
+	# -------------------------------------------------------------------
+	for mg in $(WORKINGDIR)/libmobileglues*.dylib; do \
+		[ -f "$$mg" ] || continue; \
+		mg_dep=$$(otool -L "$$mg" | awk '/spirv-cross/ { print $$1; exit }'); \
+		if [ -z "$$mg_dep" ]; then \
+			echo "[dep_shader_shims] $$(basename "$$mg"): no spirv-cross dylib dependency (statically linked) -- skip"; \
+			continue; \
+		fi; \
+		if [ ! -f "$(WORKINGDIR)/libspirv-cross-mg.dylib" ]; then \
+			mg_src="$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/libraries/ios/libspirv-cross-c-shared.dylib"; \
+			[ -f "$$mg_src" ] || mg_src="$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/libraries/ios/libspirv-cross-c-shared.dylib"; \
+			if [ ! -f "$$mg_src" ]; then \
+				echo "[dep_shader_shims] WARN: MG spirv-cross prebuilt not found -- skip decoupling"; \
+				continue; \
+			fi; \
+			cp "$$mg_src" "$(WORKINGDIR)/libspirv-cross-mg.dylib" || exit 1; \
+			install_name_tool -id @rpath/libspirv-cross-mg.dylib "$(WORKINGDIR)/libspirv-cross-mg.dylib" || exit 1; \
+		fi; \
+		install_name_tool -change "$$mg_dep" @rpath/libspirv-cross-mg.dylib "$$mg" || exit 1; \
+		echo "[dep_shader_shims] MG spvc decoupled: $$mg_dep -> @rpath/libspirv-cross-mg.dylib"; \
+	done
 	echo '[Amethyst v$(VERSION)] dep_shader_shims - end'
 
 
