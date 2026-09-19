@@ -2720,6 +2720,17 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
     ame_real_glViewport(x, y, width, height);
 }
 
+// —— 当前渲染器是否为 OSMesa 系（zink / gallium / Mesa 软栈）——
+//
+// 判定与 egl_bridge.m 的 bridge 选择同源（AMETHYST_RENDERER 以 "libOSMesa"
+// 开头 → set_osm_bridge_tbl）。OSMesa 路径没有 EGL surface，凡是以「EGL
+// surface 像素尺寸」为前提的 GL 状态纠正都不适用于它。
+static BOOL ame_isOsmesaRendererName(void) {
+    const char *r = getenv("AMETHYST_RENDERER");
+    if (r == NULL || r[0] == '\0') return NO;
+    return strncmp(r, "libOSMesa", 9) == 0;
+}
+
 // GL 函数必须来自渲染器自身。若误返回系统 GLES / EAGL 的实现，
 // LWJGL 拿到的函数指针与 EGL 上下文不匹配，会直接崩。
 static void *ame_SDL_GL_GetProcAddress(const char *proc) {
@@ -2736,7 +2747,31 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
     }
     // glViewport 走我们的包装：它是 MC 把窗口尺寸交给 GL 的最后一步，
     // 在此兜底可确保渲染区域恒等于 EGL surface（见 ame_glViewport 处注释）。
-    if (strcmp(proc, "glViewport") == 0) {
+    // —— OSMesa 系（zink / gallium）不接管 viewport / scissor ——
+    //
+    // 这套包装的设计前提是「渲染目标是 EGL surface，viewport 必须等于 surface
+    // 像素尺寸」。OSMesa/zink 路径根本没有 EGL surface：ame_eglSurfacePixelSize
+    // 在此只能退回 CAMetalLayer.drawableSize（呈现层尺寸），而 MC 真正渲染的是
+    // OSMesa 的 client buffer（尺寸由 windowWidth/windowHeight 决定，两者常常
+    // 不等）。拿呈现层尺寸去改写 OSMesa 渲染的 viewport，会把绘制推出 buffer
+    // 边界 —— buffer 内无内容，上屏即全黑（26.3 + sodium + zink 进世界后
+    // 方块/生物全黑的统一解释）。
+    //
+    // 参考仓库（Air）的 sdl3_hook 从未引入这套包装，故不存在该问题；此处对齐
+    // 其行为：OSMesa 下不包装，MC 拿到的就是本路径原生的 glViewport/glScissor。
+    //
+    // 逃生阀：AMETHYST_VIEWPORT_GUARD_OSMESA=1 可在 OSMesa 下强制恢复接管。
+    BOOL osmesaGuardOff = ame_isOsmesaRendererName() &&
+                          !ame_envFlagOn("AMETHYST_VIEWPORT_GUARD_OSMESA", false);
+    if (osmesaGuardOff) {
+        static BOOL s_osmGuardLogged = NO;
+        if (!s_osmGuardLogged) {
+            s_osmGuardLogged = YES;
+            NSLog(@"[SDLHook] OSMesa/zink path: glViewport/glScissor guard disabled "
+                  @"(no EGL surface; presenting buffer size != drawableSize)");
+        }
+    }
+    if (!osmesaGuardOff && strcmp(proc, "glViewport") == 0) {
         if (ame_real_glViewport == NULL) {
             void *rh = ame_rendererHandle();
             if (rh != NULL)
@@ -2747,7 +2782,7 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
         }
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
     }
-    if (strcmp(proc, "glScissor") == 0) {
+    if (!osmesaGuardOff && strcmp(proc, "glScissor") == 0) {
         // 与 dlsym 路径保持一致：必须校验镜像可信性，否则可能包装一份与当前
         // EGL 上下文不匹配的实现（系统 GLES 桩），一调用就崩。
         if (ame_real_glScissor == NULL ||
