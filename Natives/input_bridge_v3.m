@@ -129,10 +129,14 @@ static void initSDLEventFuncs(void) {
 }
 
 // Called from UIKit_CreateWindow to register the real SDL window
+static void ame104_armAfkHeartbeat(void);  // Task104：AFK 心跳（前向声明，实现见 pushSDLMouseWheel 之后）
+
 void Amethyst_SetSDLWindow(void *window) {
     g_sdlWindow = window;
     // Re-init in case libSDL3.dylib wasn't loaded at JNI_OnLoad time
     initSDLEventFuncs();
+    // Task 104：窗口就绪即布防 AFK 心跳（26.3 的 30fps 短 AFK 限帧根治）
+    ame104_armAfkHeartbeat();
     NSLog(@"[InputDiag] Amethyst_SetSDLWindow: %p PushEvent=%p", window, (void*)pSDL_PushEvent);
 }
 
@@ -241,6 +245,62 @@ static void pushSDLMouseWheel(float x, float y) {
 }
 
 // GLFW keycode → SDL_Scancode conversion
+// ============================================================================
+// Task 104（26.3 30fps 根治）：AFK 心跳——每 45s 推一个 (0,0) SDL 滚轮。
+//
+// 根因链（piston-data 26.3 client.jar CFR 反编译实证）：
+//   * MC 26.3 的 FramerateLimitTracker.getThrottleReason()：当
+//     inactivityFpsLimit == AFK（该版本默认值，InactivityFpsLimit 枚举仅
+//     minimized/afk 两值）且 Util.getMillis() - latestInputTime > 60000ms
+//     时返回 SHORT_AFK → getFramerateLimit() = min(maxFps, 30) = 30；
+//   * Minecraft.runTick 尾部 framerateLimit < 260 时调
+//     FramerateLimiter.limitDisplayFPS(framerateLimit)（LockSupport.parkNanos
+//     睡到 33ms/帧）；
+//   * iOS 上除触摸外没有持续输入流 → 加载期/挂机期必然越过 60s 阈值
+//     → 整个加载期 + 无操作期被压在 30fps。与渲染器无关（zink/MG/MobileGL 同病）。
+//     输入重置点仅在 MouseHandler.onButton/onScroll/onDrop/
+//     handleAccumulatedMovement（后者还要求 isWindowActive）。
+//
+// 修复策略（双保险）：
+//   1. 启动器仍写 inactivityFpsLimit=minimized（PojavLauncher，本轮加
+//      落盘校验日志）+ MCOptionUtils.set 去重写入（清掉残留的 afk 旧行）；
+//   2. 本心跳：游戏窗口就绪后每 45s 推一个 (0,0) SDL_MOUSEWHEEL ——
+//     MouseHandler.onScroll 在句柄检查后第一行就是 onInputReceived()，
+//     SHORT_AFK/LONG_AFK 的 60s/600s 阈值在游戏运行期间永不达成。
+//
+// (0,0) 滚轮的零副作用论证（26.3 反编译）：
+//   * 加载期 overlay != null → onScroll 整个处理体被跳过（仅剩
+//     onInputReceived）；
+//   * 游戏内 screen==null → scrollWheelHandler.onMouseScroll(0,0) →
+//     wheelXY=(0,0) → 提前 return（快捷栏不变）；
+//   * 菜单内 screen.mouseScrolled(x,y,0,0)：0 增量对原版控件为算术空转。
+// GLFW 路径（1.20.1 等）g_sdlWindow 恒 NULL，心跳静默不推（零回归——
+// 旧版本无 inactivityFpsLimit 机制）。
+// ============================================================================
+static void ame104_armAfkHeartbeat(void) {
+    static dispatch_source_t s_ame104_timer = nil;
+    if (s_ame104_timer) return;
+    s_ame104_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (!s_ame104_timer) return;
+    dispatch_source_set_timer(s_ame104_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)45 * NSEC_PER_SEC),
+                              (int64_t)45 * NSEC_PER_SEC,
+                              (int64_t)5 * NSEC_PER_SEC);
+    static unsigned long s_ame104_beats = 0;
+    dispatch_source_set_event_handler(s_ame104_timer, ^{
+        if (!g_sdlWindow || !pSDL_PushEvent) return;
+        pushSDLMouseWheel(0.0f, 0.0f);
+        ++s_ame104_beats;
+        if (s_ame104_beats <= 3 || s_ame104_beats % 20 == 0) {
+            NSLog(@"[InputDiag] Task104 AFK heartbeat #%lu: wheel(0,0) pushed -- MC onScroll resets the 60s inactivity clock (SHORT_AFK 30fps cap unreachable)",
+                  s_ame104_beats);
+        }
+    });
+    dispatch_resume(s_ame104_timer);
+    NSLog(@"[InputDiag] Task104 AFK heartbeat armed: 45s interval, wheel(0,0) -- inactivity FPS caps (30/10) cannot engage while the game runs");
+}
+
 static int glfwKeyToSDLScancode(int glfwKey) {
     // Printable keys: ASCII-based, same as USB HID usage
     if (glfwKey >= GLFW_KEY_A && glfwKey <= GLFW_KEY_Z) return 4 + (glfwKey - GLFW_KEY_A);   // SDL_SCANCODE_A=4
