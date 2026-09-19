@@ -48,6 +48,30 @@ if(MACOS)
         set(GLSLANG_TESTS           OFF CACHE BOOL "Disable glslang tests (needs googletest)" FORCE)
         set(GLSLANG_ENABLE_INSTALL  OFF CACHE BOOL "Disable glslang install rules" FORCE)
         add_subdirectory(3rdparty/glslang)
+        # -------------------------------------------------------------------
+        # SPIRV-Cross 从源码构建 + 静态链接（对齐参考仓库）
+        #
+        # iOS 分支此前链接 libraries/ios/ 下预编译的 libspirv-cross-c-shared.dylib：
+        # 那份二进制与从源码构建的 glslang 不同源（glslang 已按本仓库 vendored 版本
+        # 重建并打上 nullguard / pool-zero 补丁，SPIRV-Cross 却是另一份来历的预编译
+        # 产物）。MC 26.3 走 SPIR-V 管线后，MG 内部链路是
+        #   glslang 解析 GLSL330 -> SPIR-V -> SPIRV-Cross 生成 ESSL300
+        # 两端版本/ABI 不一致会在资源重载阶段把进程拖死：无 .ips、无 hs_err，表现为
+        # 静默闪退。参考仓库对该目录 add_subdirectory 并链接静态目标 spirv-cross-c，
+        # 两端同源同版本，且不产出共享库（也就不会与 spvc 垫片同名）。
+        #
+        # 仅 iOS：Android 分支继续用 libraries/${ANDROID_ABI}/ 下的预编译 .so。
+        # -------------------------------------------------------------------
+        set(SPIRV_CROSS_ENABLE_C_API   ON  CACHE BOOL "Enable C API" FORCE)
+        set(SPIRV_CROSS_ENABLE_GLSL    ON  CACHE BOOL "Enable GLSL backend" FORCE)
+        set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "Disable reflect" FORCE)
+        set(SPIRV_CROSS_ENABLE_HLSL    OFF CACHE BOOL "Disable HLSL backend" FORCE)
+        set(SPIRV_CROSS_ENABLE_MSL     OFF CACHE BOOL "Disable MSL backend" FORCE)
+        set(SPIRV_CROSS_ENABLE_CPP     OFF CACHE BOOL "Disable C++ API target" FORCE)
+        set(SPIRV_CROSS_CLI            OFF CACHE BOOL "Disable CLI binary" FORCE)
+        set(SPIRV_CROSS_STATIC         ON  CACHE BOOL "Prefer static libs" FORCE)
+        set(SPIRV_CROSS_ENABLE_UTIL    OFF CACHE BOOL "Disable util" FORCE)
+        add_subdirectory(3rdparty/SPIRV-Cross)
 endif()
 
 set(PROFILING OFF)
@@ -106,7 +130,7 @@ if(MACOS)
         set(iOS_LIB_DIR ${CMAKE_SOURCE_DIR}/libraries/ios)
         target_link_libraries(${CMAKE_PROJECT_NAME}
                 glslang::glslang
-                ${iOS_LIB_DIR}/libspirv-cross-c-shared.dylib
+                spirv-cross-c
                 "-F${CMAKE_SOURCE_DIR}/external"
                 "-framework libEGL"
                 "-framework libGLESv2"

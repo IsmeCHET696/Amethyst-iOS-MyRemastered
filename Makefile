@@ -361,7 +361,6 @@ dep_mg:
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
 		-DCMAKE_C_FLAGS="-arch arm64" \
 		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
-		-DSPIRV_CROSS_SHARED="ON" \
 		$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/
 
 	# 额外显式构建 SPIRV / glslang-default-resource-limits 两个静态库：
