@@ -19,17 +19,49 @@ jobs:
           - platform: 2
             platform_name: ios
 
-    runs-on: macos-14
+    runs-on: macos-15
 
     # 发布 nightly release 需要 contents: write
     permissions:
       contents: write
 
     steps:
-      - name: Select Xcode 15.4
+      - name: Select Xcode (prefer 26+ for iOS 26 Liquid Glass, fallback 15.4)
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          echo "== 可用 Xcode =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "== 默认 =="
           xcodebuild -version || true
+          # 选最新的 Xcode ≥ 26(液态玻璃需要 iOS 26 SDK);找不到就退 15.4。
+          PICK=""
+          for app in $(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V -r); do
+            PICK="$app"; break
+          done
+          if [ -z "$PICK" ]; then
+            for app in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V -r); do
+              v=$(basename "$app" | sed -E 's/Xcode_?([0-9]+).*/\1/')
+              if [ -n "$v" ] && [ "$v" -ge 26 ] 2>/dev/null; then PICK="$app"; break; fi
+            done
+          fi
+          if [ -n "$PICK" ]; then
+            sudo xcode-select -s "$PICK/Contents/Developer"
+            echo "★ 选用 $PICK"
+          else
+            sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+            echo "★ 未找到 Xcode 26,回退 15.4(本包不含 iOS 26 新外观)"
+          fi
+          xcodebuild -version || true
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo '?')
+          SDKPATH_REAL=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo '')
+          echo "★ iPhoneOS SDK = $SDK"
+          echo "★ SDKPATH = $SDKPATH_REAL"
+          # ★ 关键:Makefile 里是 SDKPATH ?= ...(?= 不覆盖已有值),
+          #   若环境里带着旧的 SDKPATH,或者 CMake 缓存了旧 CMAKE_OSX_SYSROOT,
+          #   就会【用旧 SDK 编译】—— 那样打包出来的 App 拿不到 iOS 26 新外观。
+          #   这里显式写入 GITHUB_ENV,强制后续所有步骤用同一个 SDK。
+          echo "SDKPATH=$SDKPATH_REAL" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          echo "★ 已写入 GITHUB_ENV:SDKPATH / DEVELOPER_DIR"
 
       - name: Install GNU Make
         run: |
