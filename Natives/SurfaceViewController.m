@@ -196,14 +196,8 @@ extern bool ame_gl_surface_transposed(void);
         pojavIncrementFpsCounter();
     }
     _tickCount++;
-    // 诊断日志：前 5 次回调 + 状态切换时输出，便于追踪 clientAPI 变化
-    static BOOL s_lastActualVulkanPath = NO;
-    BOOL stateChanged = (s_lastActualVulkanPath != actualVulkanPath);
-    if (_tickCount <= 5 || stateChanged) {
-        NSLog(@"[PLDisplayLinkTarget] displayLinkTick #%lu (configuredVulkan=%d, actualVulkanPath=%d, stateChanged=%d)",
-              (unsigned long)_tickCount, _isVulkanMode, actualVulkanPath, stateChanged);
-        s_lastActualVulkanPath = actualVulkanPath;
-    }
+    // ★ [LOG-CLEAN] 原每帧/前 5 帧打 "[PLDisplayLinkTarget] displayLinkTick #N" ⇒ 已删除
+    //   (CADisplayLink 高频回调; clientAPI 变化由实际路径行为自证, 无需逐帧日志)。
 }
 
 @end

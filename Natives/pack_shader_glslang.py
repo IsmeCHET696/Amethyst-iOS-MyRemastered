@@ -75,14 +75,21 @@
 #       的 MetalNativeBridge 【完全没有】glslang 字样（逐类二进制扫描实证），
 #       故移除该条目对 26.3/26.4 路径零影响。
 #
-# 同时补齐缺口 B：com/mojang/blaze3d/systems 的三个接口
-#   （GpuSurfaceBackend / CommandEncoderBackend / TransientMemory）必须镜像到
-#   【每一处可能被解析到的位置】，否则就是"半边可见"：
-#   某个 loader 能读到 com/metallum/** 副本，却读不到这些副本 implements 的
-#   com/mojang/blaze3d/systems/* ⇒
-#     NoClassDefFoundError: com/mojang/blaze3d/systems/GpuSurfaceBackend
-#   真机 latestlog-39.txt 的 STATE 探针 FLOW/mce/tm 三行就是这条（本机 harness
-#   用"只看得见 jar 根"的 loader 原样复现，见 D:\CTF\_SHADER_BLAZE3D_REPORT.md ④）。
+# 同时补齐缺口 B：com/mojang/blaze3d【整组】（不再是三个固定名字）
+#   ★★★ [BLAZE3D-ONDEMAND] 本脚本只负责把【镜像源】放进 jar 的三处位置(缺一即
+#   "半边可见": classes262iris/ + classes262/ + jar 根)。**是否 define 由 agent 运行时
+#   按「目标加载器能解析就不定义、只补真缺」决定**(MetallumAgent.collectBlaze3dMissing)。
+#   真机 latestlog-41 (26.2/Fabric/knot) 证明：无差别 define 会撞两类崩 ——
+#     · knot 已加载的类 → "attempted duplicate ... class definition" LinkageError；
+#     · VertexFormat(Sodium mixin 靶子)被裸定义 → 绕过 mixin → ClassCastException 启动崩。
+#   ⇒ 本脚本保留整组镜像(给"没有游戏 jar"的 loader 兜底), agent 侧改为按需补缺。
+#   这些镜像必须落到【每一处可能被解析到的位置】，否则就是"半边可见"：
+#   某个 loader 能读到 com/metallum/** 副本，却读不到这些副本 implements/引用 的
+#   com/mojang/blaze3d/** ⇒ NoClassDefFoundError。
+#   演进：latestlog-39 报 `GpuSurfaceBackend`（只补了 3 个固定名字）→ 修好后
+#   latestlog-40 退到下一层 `GpuSurface$PresentMode`（内部类）⇒ 必须整组。
+#   组 = Natives/shader_glslang/blaze3d/**（清单 blaze3d_group.txt），见
+#   Natives/extract_blaze3d_group.py 头部（从 client-26.2.jar 求【链接面闭包】）。
 #   agent 的 `collectClassNames(resPrefix + "com/mojang/blaze3d/")` 会在 com/metallum
 #   类【之前】先 define 这些类（与 classes261 类集同款机制），但那只覆盖 resPrefix
 #   这一个目录 ⇒ 三个镜像位置缺一不可（见 GLSLANG_IFACE_PREFIXES）。
@@ -100,7 +107,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))            # <tree>/Natives
 TREE = os.path.dirname(HERE)                                 # <tree>
 
 FW_DIR      = os.path.join(HERE, "resources", "Frameworks")
-CLS_DIR     = os.path.join(HERE, "shader_glslang", "blaze3d", "systems")
+# ★ [SHADER-BLAZE3D-GROUP] blaze3d 整组的源目录/清单在下面 GLSLANG_GROUP_* 定义
 AGENT_JAR   = os.path.join(TREE, "JavaApp", "libs", "others", "metallum_agent.jar")
 MOD_JAR     = os.path.join(TREE, "Natives", "resources", "mods_preload", "MetalUniversal-1.0.4.jar")
 
@@ -125,20 +132,70 @@ REQUIRED = [
     "glslang_shader_get_info_debug_log", "glslang_shader_get_info_log",
     "glslang_shader_parse", "glslang_shader_preprocess", "glslang_shader_set_options",
 ]
-GLSLANG_IFACES = ["GpuSurfaceBackend", "CommandEncoderBackend", "TransientMemory"]
+# ★ [SHADER-BLAZE3D-GROUP] 【整组镜像】—— 不再是三个硬编码名字。
+#   上一轮只镜像 3 个固定名字（GpuSurfaceBackend / CommandEncoderBackend /
+#   TransientMemory），真机 latestlog-40.txt 立刻在下一层炸：
+#       FLOW=ERR:java.lang.NoClassDefFoundError:
+#                com/mojang/blaze3d/systems/GpuSurface$PresentMode      ← 内部类($)
+#   ⇒ 要镜像的是【一整组】。组由 Natives/extract_blaze3d_group.py 从
+#     D:\CTF\client-26.2.jar 算出（= agent 真正 define 的 com/metallum/client/** +
+#     3 个接口的【链接面闭包】：超类/接口/字段方法 descriptor/泛型 Signature 引用到的
+#     com/mojang/blaze3d/**，逐个递归到闭），逐字节落到
+#       Natives/shader_glslang/blaze3d/**      (源目录)
+#       Natives/shader_glslang/blaze3d_group.txt (清单: md5/size/name)
+#   组内【不含】mixin 目标本体 (opengl/GlStateManager、systems/RenderSystem)：
+#   agent 用原始 ClassLoader.defineClass 把类 define 进 Knot ⇒ 若含 mixin 目标会
+#   绕过 Fabric/Iris mixin 变换（真机 GlStateManagerMixin 生效的证据是
+#   `[metallum:gl] reporting 6 GL extension(s)`）。见 extract 脚本头部说明。
+GLSLANG_GROUP_MANIFEST = os.path.join(HERE, "shader_glslang", "blaze3d_group.txt")
+GLSLANG_GROUP_SRC      = os.path.join(HERE, "shader_glslang", "blaze3d")
 
-# ★ [SHADER-BLAZE3D] 三个接口的镜像位置（缺一即"半边可见"）：
-#   · classes262iris/ … agent routing(iris 桥开)真正 define 的类集（上一轮已补）
-#   · classes262/     … agent routing(iris 桥关)define 的类集；
-#                       collectClassNames() 只扫 resPrefix+"com/mojang/blaze3d/"，
-#                       而 classes262/ 下【没有】该目录 ⇒ 从不收集 ⇒ 缺口
-#   · ""(jar 根)      … 与 jar 根那份 com/metallum/** 副本配对。根副本逐字节 == classes262/
-#                       （MetalSurface/MetalDevice/MetalCommandEncoder/MetalRenderPass/
-#                        MetalTransientMemory 都 implements/引用这三个接口），而根里没有
-#                       com/mojang/blaze3d/ ⇒ 任何"只看得到 jar 根"的 loader（系统/agent
-#                       loader —— -javaagent 的 jar 会被追加到它）一读 MetalSurface 就是
-#                       NoClassDefFoundError: com/mojang/blaze3d/systems/GpuSurfaceBackend
-GLSLANG_IFACE_PREFIXES = ["classes262iris/", "classes262/", ""]
+# ★ [SHADER-BLAZE3D-GROUP] 镜像位置（只在两个类集前缀）：
+#   · classes262iris/ … agent routing(iris 桥开)define 的类集
+#   · classes262/     … agent routing(iris 桥关)define 的类集
+# ★★★ [BLAZE3D-ROOT-SHADOW] 【不再】镜像到 jar 根：
+#   "-javaagent" 的 agent jar 会被追加到 app/system classpath ⇒ 放在 jar 根的
+#   com/mojang/blaze3d/** 会让 app loader 抢先服务游戏自己的类, 造成
+#   "同名包 / 不同 runtime package" 的 loader 分裂。26.4 真机实证:
+#     IndexGenerator 在 loader 'app' / RenderSystem 在 PojavClassLoader
+#     ⇒ IllegalAccessError ⇒ Could not initialize class RenderSystem ⇒ exit(1)。
+#   agent 只按前缀枚举/读取 blaze3d 类集(collectBlaze3dMissing(resPrefix) 与
+#   readClassResource(resPrefix, …)), jar 根副本【从未被读】⇒ 移除后功能零变化,
+#   只消除影子风险。本脚本同时把历史遗留的 jar 根 blaze3d 镜像【清掉】(幂等)。
+GLSLANG_IFACE_PREFIXES = ["classes262iris/", "classes262/"]
+ROOT_BLAZE3D_PREFIX = "com/mojang/blaze3d/"
+
+
+def load_group():
+    """★ [SHADER-BLAZE3D-GROUP] 读清单 + 源目录 ⇒ {class_name: bytes}。
+       逐条核对 md5/size（清单 vs 源目录）；任何不符即 FATAL。"""
+    if not os.path.isfile(GLSLANG_GROUP_MANIFEST):
+        print("FATAL: missing group manifest: %s" % GLSLANG_GROUP_MANIFEST)
+        return None
+    group, bad = {}, []
+    for ln in open(GLSLANG_GROUP_MANIFEST, encoding="utf-8"):
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        try:
+            h, sz, nm = ln.split(None, 2)
+            sz = int(sz)
+        except ValueError:
+            bad.append("BAD-LINE " + ln[:60]); continue
+        p = os.path.join(GLSLANG_GROUP_SRC, nm + ".class")
+        if not os.path.isfile(p):
+            bad.append("MISSING-SRC " + nm); continue
+        b = open(p, "rb").read()
+        if len(b) != sz or hashlib.md5(b).hexdigest() != h:
+            bad.append("SRC-MISMATCH " + nm); continue
+        group[nm] = b
+    if bad:
+        print("FATAL: blaze3d group source problem: %s" % bad[:20])
+        return None
+    if not group:
+        print("FATAL: empty blaze3d group manifest")
+        return None
+    return group
 
 
 def md5b(b):
@@ -222,40 +279,55 @@ def main():
         print("[glslang]        (加载方是 System.loadLibrary(\"glslang\")，java.library.path=<app>/Frameworks)")
         return 2
 
-    # ---- 2. blaze3d 接口源字节 ----
-    ifaces = {}
-    for c in GLSLANG_IFACES:
-        p = os.path.join(CLS_DIR, c + ".class")
-        if not os.path.isfile(p):
-            print("FATAL: missing %s" % p)
-            return 2
-        ifaces[c] = open(p, "rb").read()
+    # ---- 2. ★ [SHADER-BLAZE3D-GROUP] blaze3d【整组】源字节 ----
+    group = load_group()
+    if group is None:
+        return 2
+    n_bytes = sum(len(b) for b in group.values())
+    print("[glslang] blaze3d GROUP: %d class(es), %d B (source=client-26.2.jar, manifest=%s)"
+          % (len(group), n_bytes, os.path.basename(GLSLANG_GROUP_MANIFEST)))
 
     if check_only:
+        n_ent = len(GLSLANG_IFACE_PREFIXES) * len(group)
         for jar in (AGENT_JAR, MOD_JAR):
             _o, data = read_entries(jar)
             pres = [n for n in JAR_GLSLANG_NATIVE if n in data]
             n_cls = {}
             for pfx in GLSLANG_IFACE_PREFIXES:
-                n_cls[pfx] = sum(1 for c in GLSLANG_IFACES
-                                 if "%scom/mojang/blaze3d/systems/%s.class" % (pfx, c) in data)
+                n_cls[pfx] = sum(1 for nm in group
+                                 if (pfx + nm + ".class") in data)
             print("[check] %s : entries=%d" % (os.path.basename(jar), len(data)))
             # ★ [SHADER-SIGBUS] 期望：jar 内【没有】glslang native
             print("[check]   glslang-native-in-jar: %s   (want: NONE)"
                   % ("NONE ✓" if not pres else ("PRESENT ✗ %s" % pres)))
             for pfx in GLSLANG_IFACE_PREFIXES:
-                print("[check]   blaze3d-ifaces @ %-16s %d/%d"
-                      % (pfx or "<jar-root>", n_cls[pfx], len(GLSLANG_IFACES)))
+                print("[check]   blaze3d-group @ %-16s %d/%d"
+                      % (pfx or "<jar-root>", n_cls[pfx], len(group)))
+            # ★ [BLAZE3D-ROOT-SHADOW] jar 根必须【没有】blaze3d 镜像
+            root_shadow = [n for n in data if n.startswith(ROOT_BLAZE3D_PREFIX)
+                           and n.endswith(".class")]
+            print("[check]   blaze3d @ jar-root: %s   (want: NONE)"
+                  % ("NONE ✓" if not root_shadow
+                     else ("PRESENT ✗ %d" % len(root_shadow))))
+            if os.path.basename(jar) == os.path.basename(AGENT_JAR):
+                print("[check]   want: %d entry total (%d loc x %d class)"
+                      % (n_ent, len(GLSLANG_IFACE_PREFIXES), len(group)))
         return 0
 
-    # ---- 3. agent jar：注入 blaze3d 接口镜像 + ★ 移除 glslang native ----
+    # ---- 3. agent jar：注入 blaze3d【整组】镜像(两个类集前缀) + ★ 移除 jar 根镜像 + 移除 glslang native ----
     order, data = read_entries(AGENT_JAR)
+    # ★ [BLAZE3D-ROOT-SHADOW] 先清掉历史遗留的 jar 根 blaze3d 镜像(幂等, 消除 classpath 影子)
+    root_removed = [n for n in order if n.startswith(ROOT_BLAZE3D_PREFIX) and n.endswith(".class")]
+    if root_removed:
+        order = [n for n in order if n not in root_removed]
+        for n in root_removed:
+            data.pop(n, None)
     added = replaced = 0
     targets = {}
-    for c, b in ifaces.items():
-        # ★ [SHADER-BLAZE3D] 镜像到三处：classes262iris/ + classes262/ + jar 根
+    for c, b in group.items():
+        # ★ [SHADER-BLAZE3D-GROUP] 镜像到两处类集前缀：classes262iris/ + classes262/
         for pfx in GLSLANG_IFACE_PREFIXES:
-            targets["%scom/mojang/blaze3d/systems/%s.class" % (pfx, c)] = b
+            targets[pfx + c + ".class"] = b
     for name, blob in targets.items():
         if name in data:
             if data[name] != blob:
@@ -272,8 +344,9 @@ def main():
         for n in removed:
             data.pop(n, None)
     write_entries(AGENT_JAR, order, data)
-    print("[glslang] agent jar: +%d iface, %d replaced, -%d glslang-native %s, entries=%d"
-          % (added, replaced, len(removed), removed or "(none)", len(order)))
+    print("[glslang] agent jar: +%d group entry, %d replaced, -%d glslang-native %s, "
+          "-%d jar-root blaze3d (shadow), entries=%d"
+          % (added, replaced, len(removed), removed or "(none)", len(root_removed), len(order)))
 
     # ---- 4. mod jar：★ [SHADER-SIGBUS] 只移除 glslang native（不注入任何类）----
     n_rem, n_left = strip_jar_glslang(MOD_JAR)
@@ -290,18 +363,34 @@ def main():
                   "(会被解包成未签名副本 ⇒ dlopen 期 SIGBUS)" % (os.path.basename(jar), pres))
             ok = False
     order, data = read_entries(AGENT_JAR)
+    # ★ [SHADER-BLAZE3D-GROUP] 数量断言：每个镜像位置必须恰好 len(group) 条，且逐字节一致
+    n_expect = len(GLSLANG_IFACE_PREFIXES) * len(group)
     bad = []
     for pfx in GLSLANG_IFACE_PREFIXES:
-        for c, b in ifaces.items():
-            name = "%scom/mojang/blaze3d/systems/%s.class" % (pfx, c)
+        for c, b in group.items():
+            name = pfx + c + ".class"
             if data.get(name) != b:
                 bad.append(name)
+    # 旧 3 名字的"位置计数"式核对（防误删/漏删）：blaze3d 条目总数必须 == 期望
+    n_mirror = sum(1 for n in data if any(n == (pfx + c + ".class")
+                                          for pfx in GLSLANG_IFACE_PREFIXES for c in group))
     if bad:
-        print("[glslang] FATAL: blaze3d iface mirror mismatch: %s" % bad)
+        print("[glslang] FATAL: blaze3d group mirror mismatch (%d): %s" % (len(bad), bad[:10]))
+        ok = False
+    elif n_mirror != n_expect:
+        print("[glslang] FATAL: blaze3d group mirror count %d != expected %d" % (n_mirror, n_expect))
         ok = False
     else:
-        print("[glslang] VERIFY blaze3d ifaces: %d location(s) x %d class(es) = %d entry, all byte-identical"
-              % (len(GLSLANG_IFACE_PREFIXES), len(ifaces), len(GLSLANG_IFACE_PREFIXES) * len(ifaces)))
+        print("[glslang] VERIFY blaze3d GROUP: %d location(s) x %d class(es) = %d entry, "
+              "all byte-identical + count-asserted" % (len(GLSLANG_IFACE_PREFIXES), len(group), n_expect))
+    # ★ [BLAZE3D-ROOT-SHADOW] 硬断言: jar 根不得残留任何 blaze3d 镜像
+    root_shadow = [n for n in data if n.startswith(ROOT_BLAZE3D_PREFIX) and n.endswith(".class")]
+    if root_shadow:
+        print("[glslang] FATAL: jar-root blaze3d shadow still present (%d): %s"
+              % (len(root_shadow), root_shadow[:10]))
+        ok = False
+    else:
+        print("[glslang] VERIFY blaze3d @ jar-root: NONE ✓ (no app-loader shadow)")
     if not ok:
         return 2
     print("[glslang] VERIFY glslang route: Frameworks-only "

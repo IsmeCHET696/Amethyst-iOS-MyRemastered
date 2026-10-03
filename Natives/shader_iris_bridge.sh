@@ -25,7 +25,11 @@ done
 [ -f "$JAR" ] || { echo "agent jar not found: $JAR"; exit 1; }
 # native Windows python 看不懂 MSYS 路径(/d/..) ⇒ 传给它之前转成原生路径(Mac 上无 cygpath, 原样)
 JARW="$JAR"
-if command -v cygpath >/dev/null 2>&1; then JARW="$(cygpath -w "$JAR")"; fi
+MANW="$HERE/shader_glslang/blaze3d_group.txt"          # ★ [SHADER-BLAZE3D-GROUP]
+if command -v cygpath >/dev/null 2>&1; then
+  JARW="$(cygpath -w "$JAR")"
+  MANW="$(cygpath -w "$MANW")"
+fi
 
 case "${1:-status}" in
   on|off)
@@ -60,9 +64,16 @@ else:
 PYEOF
     ;;
   status)
-    "$PY" - "$JARW" <<'PYEOF'
-import zipfile, sys
+    "$PY" - "$JARW" "$MANW" <<'PYEOF'
+import zipfile, sys, os
 z = zipfile.ZipFile(sys.argv[1]); n = z.namelist()
+man = sys.argv[2]
+group = []
+if os.path.isfile(man):
+    for ln in open(man, encoding="utf-8"):
+        ln = ln.strip()
+        if ln and not ln.startswith("#"):
+            group.append(ln.split(None, 2)[2])
 cls = sum(1 for x in n if x.startswith("classes262iris/"))
 ir1 = [x for x in n if x.startswith("natives/ir1/")]
 print("marker metallum_iris.mode :", "PRESENT" if "metallum_iris.mode" in n else "absent")
@@ -70,11 +81,16 @@ print("classes262iris/ entries   :", cls)
 print("natives/ir1/ entries      :", ir1)
 print("natives/ios libmetallum   :", "%d B" % len(z.read("natives/ios/libmetallum.dylib")),
       "(26.3 route, must stay 221856)")
-# ★ [SHADER-BLAZE3D] 三个 blaze3d 接口的镜像位置（缺一 = "半边可见" ⇒ 真机 NoClassDefFoundError）
-IFACES = ["GpuSurfaceBackend", "CommandEncoderBackend", "TransientMemory"]
-for pfx in ("classes262iris/", "classes262/", ""):
-    have = sum(1 for c in IFACES if ("%scom/mojang/blaze3d/systems/%s.class" % (pfx, c)) in n)
-    print("blaze3d-ifaces @ %-16s: %d/%d" % (pfx or "<jar-root>", have, len(IFACES)))
+# ★ [SHADER-BLAZE3D-GROUP] blaze3d【整组】的镜像位置（缺一 = "半边可见" ⇒ 真机 NoClassDefFoundError）
+print("blaze3d group size        :", "%d class(es) (manifest %s)" % (len(group), os.path.basename(man)))
+PREFIXES = ("classes262iris/", "classes262/", "")
+tot = 0
+for pfx in PREFIXES:
+    have = sum(1 for c in group if (pfx + c + ".class") in n)
+    tot += have
+    print("blaze3d-group @ %-16s: %d/%d" % (pfx or "<jar-root>", have, len(group)))
+print("blaze3d group mirror total: %d (want %d = %d loc x %d class)"
+      % (tot, len(PREFIXES) * len(group), len(PREFIXES), len(group)))
 # ★ [IRIS-INTEGRATE] 26.2-iris 走 91 符号那份额外的 native（见 Natives/verify_iris_integrate.py）
 MNB = "classes262iris/com/metallum/client/metal/render/bridge/MetalNativeBridge.class"
 wire = (MNB in n) and (b"metallum_iris" in z.read(MNB))

@@ -342,11 +342,24 @@ iris-bridge-status:
 #     （真机实证：SIGBUS at [libglslang_metallum.dylib+0xccbc4] _GLOBAL__sub_I_Scan.cpp，
 #      且紧邻日志的 PrepareRegion len==2392064==该 dylib __TEXT.vmsize；
 #      历史档案 VERSION_HISTORY.md v378 `noglslanginjar.ipa` 同结论）。
-#   · classes262iris/ + classes262/ + jar 根 三处补 com/mojang/blaze3d/systems 三个接口（缺口 B）
-#     ★ [SHADER-BLAZE3D] 三个接口必须镜像到三处：
-#       根那份 com/metallum/** 副本(逐字节 == classes262/) implements 它们，根里却没有
-#       com/mojang/blaze3d/ ⇒ "只看得到 jar 根"的 loader 一读就 NoClassDefFoundError
-#       （真机 latestlog-39 STATE 探针 FLOW/mce/tm）。
+#   · classes262iris/ + classes262/ 两个类集前缀补 com/mojang/blaze3d【整组】（缺口 B）
+#     ★ [BLAZE3D-ROOT-SHADOW] 【不再】镜像到 jar 根 —— "-javaagent" 的 jar 在 app/system
+#       classpath 上, 根副本会让 app loader 影子化游戏自己的类 (26.4 真机:
+#       RenderSystem$AutoStorageIndexBuffer$IndexGenerator 被 app 装载 ⇒ 同名包不同
+#       runtime package ⇒ IllegalAccessError ⇒ Could not initialize class RenderSystem)。
+#     ★ [SHADER-BLAZE3D-GROUP] 不再是"三个固定名字"：组 = Natives/shader_glslang/blaze3d/**
+#       （清单 blaze3d_group.txt），由 Natives/extract_blaze3d_group.py 从 client-26.2.jar
+#       算出 = agent 真正 define 的 com/metallum/client/** + 3 接口的【链接面闭包】
+#       （超类/接口/字段方法 descriptor/泛型 Signature/throws）。上一轮只补 3 个固定名字，
+#       真机 latestlog-40 立刻在下一层炸：
+#           NoClassDefFoundError: com/mojang/blaze3d/systems/GpuSurface$PresentMode  ← 内部类($)
+#       根那份 com/metallum/** 副本(逐字节 == classes262/) implements/引用它们，根里却没有
+#       com/mojang/blaze3d/ ⇒ "只看得到 jar 根"的 loader 一读就 NoClassDefFoundError。
+#       ★ 组内【不含】mixin 目标本体(opengl/GlStateManager、systems/RenderSystem)：agent 用
+#         原始 defineClass 把它们 define 进 Knot 会绕过 Fabric/Iris mixin。
+#   ★ 重新求组(仅在有 client-26.2.jar 的机器上跑；Mac 出包线【不】跑):
+#       python Natives/extract_blaze3d_group.py --check      # 只核对清单/源目录/闭包
+#       python Natives/extract_blaze3d_group.py              # 重算并落源目录+清单
 #   真机缺口见 latestlog-38.txt：Symbol not found: glslang_initialize_process
 shader-glslang-pack:
 	python3 Natives/pack_shader_glslang.py
@@ -354,6 +367,11 @@ shader-glslang-pack:
 shader-glslang-check:
 	python3 Natives/pack_shader_glslang.py --check
 	python3 Natives/verify_iris_integrate.py          # ★ [IRIS-INTEGRATE]
+
+# ★ [SHADER-BLAZE3D-GROUP] blaze3d 整组自检（清单 vs 源目录 vs 闭包）——
+#   只能在有 D:\CTF\client-26.2.jar 的机器上跑（Mac 出包线不需要它）。
+blaze3d-group-check:
+	python3 Natives/extract_blaze3d_group.py --check
 
 # ★ [IRIS-INTEGRATE] 让 26.2-iris 吃 91 符号的 libmetallum_iris.dylib，而 26.3/26.1 继续吃
 #   Frameworks/libmetallum.dylib（75 符号，含 getError/getStatus/get_last_error）—— 同一个包两条路线。

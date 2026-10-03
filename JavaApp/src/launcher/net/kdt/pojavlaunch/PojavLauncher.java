@@ -285,7 +285,11 @@ public class PojavLauncher {
         // For Minecraft 1.0 and earlier, no language option
         MCOptionUtils.save();
         String configPath = null;
-        if (version.logging != null) {
+        // ★ [DEMINE] 原为 version.logging.client.file.id 直接链式取值：logging 非空但
+        //   client / file / id 为 null(自定义或精简的 version json)时 NPE ⇒ main 线程
+        //   未捕获处理器 System.exit(1) 杀掉 App。逐级判空，缺失则走下方 fallback 配置。
+        if (version.logging != null && version.logging.client != null
+                && version.logging.client.file != null && version.logging.client.file.id != null) {
             if (version.logging.client.file.id.equals("client-1.12.xml")) {
                 configPath = Tools.DIR_BUNDLE + "/log4j-rce-patch-1.12.xml";
             } else if (version.logging.client.file.id.equals("client-1.7.xml")) {

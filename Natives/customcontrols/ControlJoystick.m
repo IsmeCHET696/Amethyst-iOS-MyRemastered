@@ -201,7 +201,12 @@ NSMutableDictionary* createButton(NSString* name, int* keycodes, NSString* dynam
 }
 
 - (void)update {
-    NSAssert(self.superview != nil, @"should not be nil");
+    // ★ [DEMINE] NSAssert 在发布包中仍生效(未定义 NS_BLOCK_ASSERTIONS)：摇杆脱离
+    //   父视图后的一次 update 会崩整个 App。降级为记日志并跳过(正常路径不变)。
+    if (self.superview == nil) {
+        NSLog(@"[DEMINE] ControlJoystick -update called with nil superview; skipping");
+        return;
+    }
 
     self.displayInGame = [self.properties[@"displayInGame"] boolValue];
     self.displayInMenu = [self.properties[@"displayInMenu"] boolValue];

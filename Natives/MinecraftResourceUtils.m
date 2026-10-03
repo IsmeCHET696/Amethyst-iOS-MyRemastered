@@ -213,11 +213,21 @@
     }
 
     for (NSMutableDictionary *lib in json[@"libraries"]) {
-        NSString *libName = [lib[@"name"] substringToIndex:[lib[@"name"] rangeOfString:@":" options:NSBackwardsSearch].location];
+        // ★ [DEMINE] 原为 name 直接 rangeOfString:@":" 取 location 再 substringToIndex：
+        //   库名不含冒号(非标准 Maven 坐标 / 异常 version json)时 location==NSNotFound
+        //   ⇒ substringToIndex 越界 NSRangeException 崩 App。缺冒号则跳过该库。
+        NSString *libRawName = lib[@"name"];
+        NSRange libColonRange = [libRawName rangeOfString:@":" options:NSBackwardsSearch];
+        if (libColonRange.location == NSNotFound) continue;
+        NSString *libName = [libRawName substringToIndex:libColonRange.location];
         int i;
         for (i = 0; i < [inheritsFrom[@"libraries"] count]; i++) {
             NSMutableDictionary *libAdded = inheritsFrom[@"libraries"][i];
-            NSString *libAddedName = [libAdded[@"name"] substringToIndex:[libAdded[@"name"] rangeOfString:@":" options:NSBackwardsSearch].location];
+            // ★ [DEMINE] 同上：libAdded 名字无冒号时 substringToIndex 越界崩 App。
+            NSString *libAddedRawName = libAdded[@"name"];
+            NSRange libAddedColonRange = [libAddedRawName rangeOfString:@":" options:NSBackwardsSearch];
+            if (libAddedColonRange.location == NSNotFound) continue;
+            NSString *libAddedName = [libAddedRawName substringToIndex:libAddedColonRange.location];
 
             if ([libAdded[@"name"] hasPrefix:libName]) {
                 inheritsFrom[@"libraries"][i] = lib;
@@ -316,7 +326,14 @@
             [library[@"name"] hasPrefix:@"org.lwjgl"]
         );
 
-        NSString *versionStr = [library[@"name"] componentsSeparatedByString:@":"][2];
+        NSArray<NSString *> *libNameParts = [library[@"name"] componentsSeparatedByString:@":"];
+        // ★ [DEMINE] 原为 componentsSeparatedByString:@":"][2] 直接下标：库名非标准三段
+        //   (group:artifact:version) 时越界 NSRangeException 崩 App。缺段则跳过该库的版本改写。
+        if (libNameParts.count < 3) {
+            NSLog(@"[DEMINE] tweakVersionJson: non-3-part library name '%@' -- skipping version rewrite", library[@"name"]);
+            continue;
+        }
+        NSString *versionStr = libNameParts[2];
         NSArray<NSString *> *version = [versionStr componentsSeparatedByString:@"."];
         if ([library[@"name"] hasPrefix:@"net.java.dev.jna:jna:"]) {
             // 强制将 JNA 替换为 5.13.0 以保证 iOS 兼容性。
@@ -415,7 +432,13 @@
     if ([version isKindOfClass:NSString.class]){
         // Find in inheritsFrom
         NSDictionary *versionDict = parseJSONFromFile([NSString stringWithFormat:@"%1$s/versions/%2$@/%2$@.json", getenv("POJAV_GAME_DIR"), version]);
-        NSAssert(versionDict != nil, @"version should not be null");
+        // ★ [DEMINE] 该 NSAssert 在发布包中仍生效：某个版本 JSON 尚未下载/损坏时
+        //   versionDict 为 nil ⇒ 直接崩 App。紧随其后的 `versionDict[@"inheritsFrom"]`
+        //   对 nil 返回 nil 并已优雅 return nil，故这里降级为记日志后走同一条路径。
+        if (versionDict == nil) {
+            NSLog(@"[DEMINE] findNearestVersion: version json missing/corrupt for '%@' -- returning nil", version);
+            return nil;
+        }
         if (versionDict[@"inheritsFrom"] == nil) {
             // How then?
             return nil; 

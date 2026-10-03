@@ -184,7 +184,8 @@ void* hooked_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
         // 真机日志一眼就能看出"哪个 dylib 走了危险路径"。
         do {
             static int s_ameSigbusMmapLogs = 0;
-            if (s_ameSigbusMmapLogs < 12) {
+            // ★ [LOG-CLEAN] 原允许 12 行 ⇒ 只打一次(同句多份 dylib 重复刷屏)。
+            if (s_ameSigbusMmapLogs < 1) {
                 ++s_ameSigbusMmapLogs;
                 char fpath[1024] = {0};
                 const char *who = "(unknown fd / not a file)";

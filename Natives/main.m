@@ -151,7 +151,11 @@ void init_redirectStdio() {
 
     if (!file) {
         NSLog(@"[Pre-init] Error: failed to open %@", currName);
-        assert(0 && "Failed to open latestlog.txt. Check oslog for more details.");
+        // ★ [DEMINE] 原为 assert(0,...)：Release 下 C assert 被 -DNDEBUG 编译掉(无效)，
+        //   但 Debug 构建会在此直接 abort 整个启动；且一旦走到这里，原代码仍会把
+        //   stdout/stderr 重定向进管道、由 nil 的 file 静默吞掉全部输出 —— 用户什么都
+        //   看不到。这里降级为记日志并直接返回(保持 oslog 输出)，App 继续启动。
+        return;
     }
 
     setvbuf(stdout, 0, _IOLBF, 0); // make stdout line-buffered

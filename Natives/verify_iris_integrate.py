@@ -27,7 +27,12 @@ T510_DYLIB = os.path.join(FW, "libmetallum.dylib")
 PREFIX = "classes262iris/"
 MNB = "com/metallum/client/metal/render/bridge/MetalNativeBridge.class"
 IFACES = ["GpuSurfaceBackend", "CommandEncoderBackend", "TransientMemory"]
-IFACE_PREFIXES = ["classes262iris/", "classes262/", ""]
+# ★ [BLAZE3D-ROOT-SHADOW] 镜像位置去掉 jar 根: jar 根在 app/system classpath 上,
+#   放 com/mojang/blaze3d/** 会让 app loader "影子化"游戏自己的类 (26.4 真机:
+#   RenderSystem$AutoStorageIndexBuffer$IndexGenerator 被 app 装载 ⇒ 同名包不同 loader ⇒
+#   IllegalAccessError ⇒ Could not initialize class RenderSystem)。agent 只按前缀读类集,
+#   根副本从不需要 ⇒ 只保留两个类集前缀。
+IFACE_PREFIXES = ["classes262iris/", "classes262/"]
 IRIS_DYLIB_MD5 = "f83b1b3b8e521b57c482e0dddec06df4"      # 91 符号（r10 世代 native）
 T510_DYLIB_MD5 = "edadd02ab39a1dde269aa77a93f68531"      # 75 符号（26.3/26.1 用，须原样）
 FEATURES = {
@@ -114,12 +119,16 @@ def main():
         if not ok:
             bad.append("libmetallum.dylib 不再是 26.3 基线（26.3/26.1 可能掉 getError/getStatus/get_last_error）")
 
-    # 5. blaze3d 三处镜像 + marker
+    # 5. blaze3d 镜像 + marker（★ [BLAZE3D-ROOT-SHADOW] 只在两个类集前缀，不在 jar 根）
     grid = [sum(1 for c in IFACES if "%scom/mojang/blaze3d/systems/%s.class" % (p, c) in an) for p in IFACE_PREFIXES]
     marker = "metallum_iris.mode" in an
-    print("[5] blaze3d-ifaces @ 3 prefixes      : %s   marker=%s" % (grid, marker))
-    if grid != [3, 3, 3]:
+    print("[5] blaze3d-ifaces @ 2 classsets     : %s   marker=%s" % (grid, marker))
+    if grid != [3, 3]:
         bad.append("blaze3d iface mirrors incomplete: %s" % grid)
+    root_shadow = [n for n in an if n.startswith("com/mojang/blaze3d/")]
+    print("[5b] blaze3d @ jar-root (must be 0)  : %d" % len(root_shadow))
+    if root_shadow:
+        bad.append("jar-root blaze3d mirror present (loader shadow risk): %d entries" % len(root_shadow))
     if not marker:
         bad.append("metallum_iris.mode marker missing")
 

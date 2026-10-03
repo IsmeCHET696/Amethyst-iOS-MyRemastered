@@ -288,7 +288,11 @@ static inline BOOL AmeTuneGlassBackdrop(UIVisualEffectView *vev, CGFloat blurRad
     @try { backdrop = [vev valueForKey:@"backdropView"]; } @catch (__unused NSException *e) { backdrop = nil; }
     @try { if (backdrop) { layer = [backdrop valueForKey:@"backdropLayer"]; } } @catch (__unused NSException *e) { layer = nil; }
     if (layer == nil) {
-        NSLog(@"[glass] blur=%.0f saturate=%.0f%% 未应用(系统材质默认:私有 backdrop 通道不可用)", blurRadius, saturation * 100.0);
+        // ★ [LOG-CLEAN] 原每次贴玻璃都打(同句 20+ 次 ⇒ 刷屏)。只报第一次。
+        static int s_ameGlassNoBackdropLogged = 0;
+        if (s_ameGlassNoBackdropLogged++ == 0) {
+            NSLog(@"[glass] blur=%.0f saturate=%.0f%% 未应用(系统材质默认:私有 backdrop 通道不可用)", blurRadius, saturation * 100.0);
+        }
         return NO;
     }
     BOOL ok = NO;
@@ -308,8 +312,12 @@ static inline BOOL AmeTuneGlassBackdrop(UIVisualEffectView *vev, CGFloat blurRad
         }
         [layer setValue:filters forKey:@"filters"];
     } @catch (__unused NSException *e) { ok = NO; }
-    NSLog(@"[glass] blur=%.0f saturate=%.0f%% %@", blurRadius, saturation * 100.0,
-          ok ? @"已应用(SPEC §2.5)" : @"未应用(回退系统默认)");
+    // ★ [LOG-CLEAN] 原每次调用都打一行 ⇒ 只报第一次(已应用/未应用任一路径)。
+    static int s_ameGlassTuneLogged = 0;
+    if (s_ameGlassTuneLogged++ == 0) {
+        NSLog(@"[glass] blur=%.0f saturate=%.0f%% %@", blurRadius, saturation * 100.0,
+              ok ? @"已应用(SPEC §2.5)" : @"未应用(回退系统默认)");
+    }
     return ok;
 }
 
