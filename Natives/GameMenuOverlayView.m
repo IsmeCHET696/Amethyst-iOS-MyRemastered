@@ -69,7 +69,7 @@ static const CGFloat kDragThreshold = 10.0;
         self.userInteractionEnabled = YES;
         // 默认显示 FPS/内存标签（可通过菜单开关）
         _statsLabelVisible = YES;
-        _overlayHidden = NO;
+        _overlayHidden = YES;
         // ★ [ISSUE-152] 悬浮球默认显示 = 不改变现状；随后按偏好覆盖。
         _menuButtonVisible = YES;
 
@@ -84,7 +84,7 @@ static const CGFloat kDragThreshold = 10.0;
             _menuButtonVisible = [savedMenuBtn boolValue];
         }
 
-        [self setupMenuButton];
+        // [self setupMenuButton];
         [self setupStatsLabel];
         [parentView addSubview:self];
 
@@ -126,10 +126,10 @@ static const CGFloat kDragThreshold = 10.0;
     [self.menuButton addGestureRecognizer:pan];
 
     // 点击事件
-    [self.menuButton addTarget:self action:@selector(menuButtonTouchedDown:) forControlEvents:UIControlEventTouchDown];
-    [self.menuButton addTarget:self action:@selector(menuButtonTouchedUp:) forControlEvents:UIControlEventTouchUpInside];
+    // [self.menuButton addTarget:self action:@selector(menuButtonTouchedDown:) forControlEvents:UIControlEventTouchDown];
+    // [self.menuButton addTarget:self action:@selector(menuButtonTouchedUp:) forControlEvents:UIControlEventTouchUpInside];
 
-    [self addSubview:self.menuButton];
+    // [self addSubview:self.menuButton];
 }
 
 - (void)setupStatsLabel {
