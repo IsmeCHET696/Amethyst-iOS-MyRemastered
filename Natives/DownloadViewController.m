@@ -5684,9 +5684,9 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
         };
 
         if (dep.apiSource == 1) {
-            [[ModrinthAPI sharedAPI] getVersionsForModWithID:dep.projectId completion:pickAndDownload];
+            [[ModrinthAPI sharedInstance] getVersionsForModWithID:dep.projectId completion:pickAndDownload];
         } else {
-            [[CurseForgeAPI sharedAPI] getVersionsForModWithID:dep.projectId completion:pickAndDownload];
+            [[CurseForgeAPI sharedInstance] getVersionsForModWithID:dep.projectId completion:pickAndDownload];
         }
     };
     nextStep();

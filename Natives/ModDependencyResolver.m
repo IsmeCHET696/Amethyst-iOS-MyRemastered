@@ -312,9 +312,9 @@ static const NSInteger kMaxDepth = 8;
     };
 
     if (dep.apiSource == 1) {
-        [[ModrinthAPI sharedAPI] getVersionsForModWithID:dep.projectId completion:handle];
+        [[ModrinthAPI sharedInstance] getVersionsForModWithID:dep.projectId completion:handle];
     } else {
-        [[CurseForgeAPI sharedAPI] getVersionsForModWithID:dep.projectId completion:handle];
+        [[CurseForgeAPI sharedInstance] getVersionsForModWithID:dep.projectId completion:handle];
     }
 }
 
