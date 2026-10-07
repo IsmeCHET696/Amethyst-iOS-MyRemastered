@@ -23,6 +23,10 @@ NS_ASSUME_NONNULL_BEGIN
 // CurseForge project ID
 @property (nonatomic, copy, nullable) NSString *projectId;
 
+/// 原始 JSON（依赖解析需要读 dependencies[]，而其余字段都是拍平后的）。
+/// Modrinth 与 CurseForge 两种来源都保留其原始字典。
+@property (nonatomic, copy, readonly, nullable) NSDictionary *rawDictionary;
+
 - (nullable instancetype)initWithDictionary:(NSDictionary *)dictionary;
 
 @end

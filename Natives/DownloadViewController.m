@@ -12,6 +12,7 @@
 #import "installer/modpack/CurseForgeAPI.h"
 #import "PLPreferences.h"
 #import "ModService.h"
+#import "ModDependencyResolver.h"
 #import "ShaderService.h"
 #import "ResourcePackService.h"
 #import "DataPackService.h"
@@ -5539,9 +5540,40 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
     // 模组下载走 ModService（resourcepack/datapack/world 已改走 AssetVersionViewController）
     self.pendingDownloadType = nil;
 
-    // 子页面已 push 到导航栈，选完版本后 pop 回下载列表
+    // ★ [MOD-DEPENDENCY] 依赖（前置）解析：
+    //   此前下载一个模组后，若它声明了必需前置（如 Iris 需要 Sodium、
+    //   Sodium 需要 Fabric API），用户必须自己去找、自己装，否则启动即崩
+    //   或功能静默失效。这里对齐 ZalithLauncher2 的依赖图解析：先算出还需要
+    //   哪些前置，再连同主模组一起下载。
+    ModVersion *selectedVersion = version;
+    NSString *profileName = self.targetProfileName ?: @"default";
+    // 子页面已 push 到导航栈，选完版本后先 pop 回下载列表
     [self.navigationController popViewControllerAnimated:YES];
-    [self startDownloadForModItem:itemToDownload];
+
+    __weak typeof(self) weakSelf = self;
+    [[ModDependencyResolver sharedResolver] resolveDependenciesFromVersionDetail:selectedVersion.rawDictionary
+                                                                       apiSource:selectedVersion.apiSource
+                                                            installedProjectIds:nil
+                                                                          loader:self.currentModLoader
+                                                                     gameVersion:self.currentGameVersion
+                                                                      completion:^(ModDependencyPlan *plan, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSArray<ModDependencyItem *> *deps = plan.required ?: @[];
+        if (deps.count == 0) {
+            [strongSelf startDownloadForModItem:itemToDownload];
+            return;
+        }
+        NSLog(@"[DLVC] mod %@ has %lu required dependency(ies), %lu optional, %lu truncated",
+              itemToDownload.displayName, (unsigned long)deps.count,
+              (unsigned long)plan.optional.count, (unsigned long)plan.truncated.count);
+        [strongSelf installDependencies:deps
+                               forItem:itemToDownload
+                             toProfile:profileName
+                            completion:^{
+            [strongSelf startDownloadForModItem:itemToDownload];
+        }];
+    }];
 }
 
 #pragma mark - AssetVersionViewControllerDelegate
@@ -5588,6 +5620,78 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 
 // 下载 Mod（redesign-download-ui Phase 4：进度由 Service 内部注册的下载任务 +
 // PLTaskStagesSingleFile 单阶段上报驱动统一进度页，调用方无需管理进度 UI。）
+#pragma mark - ★ [MOD-DEPENDENCY] 前置安装
+
+/// 逐个把必需前置下载到目标实例，全部结束后再回调（串行，避免同目录并发写）。
+/// 单个前置失败不中断整条链：记录后继续，最后把失败清单汇总提示，
+/// 这样用户至少能拿到部分可用的环境，而不是一事无成。
+- (void)installDependencies:(NSArray<ModDependencyItem *> *)deps
+                    forItem:(ModItem *)owner
+                  toProfile:(NSString *)profileName
+                 completion:(void (^)(void))completion {
+    if (deps.count == 0) {
+        if (completion) completion();
+        return;
+    }
+    NSMutableArray<ModDependencyItem *> *remaining = [deps mutableCopy];
+    NSMutableArray<NSString *> *failures = [NSMutableArray new];
+
+    __block void (^nextStep)(void) = nil;
+    __weak typeof(self) weakSelf = self;
+    nextStep = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (remaining.count == 0) {
+            if (failures.count > 0) {
+                NSLog(@"[DLVC] %lu dependency(ies) failed for %@: %@",
+                      (unsigned long)failures.count, owner.displayName,
+                      [failures componentsJoinedByString:@", "]);
+            }
+            if (completion) completion();
+            return;
+        }
+        ModDependencyItem *dep = remaining.firstObject;
+        [remaining removeObjectAtIndex:0];
+
+        // 拉该前置的版本列表，挑一个匹配当前实例 loader / MC 版本的，再下载。
+        void (^pickAndDownload)(NSArray<ModVersion *> *, NSError *) = ^(NSArray<ModVersion *> *versions, NSError *error) {
+            ModVersion *picked = nil;
+            for (ModVersion *v in versions) {
+                if (strongSelf.currentGameVersion.length > 0 &&
+                    ![v.gameVersions containsObject:strongSelf.currentGameVersion]) continue;
+                picked = v; break;
+            }
+            if (picked == nil) picked = versions.firstObject;
+            NSDictionary *pf = picked.primaryFile;
+            if (error || ![pf[@"url"] isKindOfClass:[NSString class]]) {
+                [failures addObject:dep.projectId ?: @"?"];
+                nextStep();
+                return;
+            }
+            ModItem *depItem = [[ModItem alloc] init];
+            depItem.displayName = picked.name ?: dep.projectId;
+            depItem.fileName = pf[@"filename"] ?: [NSString stringWithFormat:@"%@.jar", dep.projectId];
+            depItem.selectedVersionDownloadURL = pf[@"url"];
+            depItem.fileSHA1 = PLSha1FromPrimaryFile(pf);
+            [[ModService sharedService] downloadMod:depItem
+                                          toProfile:profileName
+                                       expectedSHA1:depItem.fileSHA1
+                                           progress:nil
+                                         completion:^(NSError *dlError) {
+                if (dlError) [failures addObject:dep.projectId ?: @"?"];
+                nextStep();
+            }];
+        };
+
+        if (dep.apiSource == 1) {
+            [[ModrinthAPI sharedAPI] getVersionsForModWithID:dep.projectId completion:pickAndDownload];
+        } else {
+            [[CurseForgeAPI sharedAPI] getVersionsForModWithID:dep.projectId completion:pickAndDownload];
+        }
+    };
+    nextStep();
+}
+
 - (void)startDownloadForModItem:(ModItem *)item {
     // 关键修复（目标实例不一致）：统一使用打开下载页时锁定的 targetProfileName，
     // 而非实时读取 selectedProfileName，避免与资源管理页绑定的实例不一致导致写入另一游戏目录

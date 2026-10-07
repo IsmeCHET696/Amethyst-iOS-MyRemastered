@@ -12,6 +12,9 @@
         if (![dictionary isKindOfClass:[NSDictionary class]]) {
             return nil;
         }
+        // 保留原始 JSON：依赖解析（ModDependencyResolver）要从 dependencies[] 读
+        // 前置列表，而下面拍平的字段里没有它。
+        _rawDictionary = [dictionary copy];
 
         // CurseForge file 格式适配（识别 gameVersions/downloadUrl/fileLength/fileDate/id/modId 字段）
         // ★ [MODSRC-FIX] CurseForge 对部分文件返回 downloadUrl:null（JSON null → NSNull，非 nil），
