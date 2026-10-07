@@ -2039,7 +2039,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                 }
                 [strongSelf.modList addObjectsFromArray:results];
                 strongSelf.hasMoreMods = (results.count >= 30);
-                strongSelf.currentModOffset += results.count;
+                // offset 必须按「请求量」递增，不能按「返回条数」。results 是追加进
+                // 列表的批次，一旦某页返回数 < limit（末页 / 镜像截断 / 服务端
+                // clamp），用 results.count 递增会让下一轮 offset 偏小，
+                // 导致重复拉取并插入重复项。limit 固定 30，故 += 30。
+                strongSelf.currentModOffset += 30;
                 
                 [strongSelf.modTableView reloadData];
                 strongSelf.emptyLabel.hidden = (strongSelf.modList.count > 0);
@@ -2120,7 +2124,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                 }
                 [strongSelf.shaderList addObjectsFromArray:results];
                 strongSelf.hasMoreShaders = (results.count >= 30);
-                strongSelf.currentShaderOffset += results.count;
+                // offset 必须按「请求量」递增，不能按「返回条数」。results 是追加进
+                // 列表的批次，一旦某页返回数 < limit（末页 / 镜像截断 / 服务端
+                // clamp），用 results.count 递增会让下一轮 offset 偏小，
+                // 导致重复拉取并插入重复项。limit 固定 30，故 += 30。
+                strongSelf.currentShaderOffset += 30;
                 
                 [strongSelf.shaderTableView reloadData];
                 strongSelf.emptyLabel.hidden = (strongSelf.shaderList.count > 0);
@@ -2191,7 +2199,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                 }
                 [strongSelf.modpackList addObjectsFromArray:results];
                 strongSelf.hasMoreModpacks = (results.count >= 30);
-                strongSelf.currentModpackOffset += results.count;
+                // offset 必须按「请求量」递增，不能按「返回条数」。results 是追加进
+                // 列表的批次，一旦某页返回数 < limit（末页 / 镜像截断 / 服务端
+                // clamp），用 results.count 递增会让下一轮 offset 偏小，
+                // 导致重复拉取并插入重复项。limit 固定 30，故 += 30。
+                strongSelf.currentModpackOffset += 30;
                 
                 [strongSelf.modpackTableView reloadData];
                 strongSelf.emptyLabel.hidden = (strongSelf.modpackList.count > 0);
@@ -2262,7 +2274,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                 }
                 [strongSelf.resourcepackList addObjectsFromArray:results];
                 strongSelf.hasMoreResourcepacks = (results.count >= 30);
-                strongSelf.currentResourcepackOffset += results.count;
+                // offset 必须按「请求量」递增，不能按「返回条数」。results 是追加进
+                // 列表的批次，一旦某页返回数 < limit（末页 / 镜像截断 / 服务端
+                // clamp），用 results.count 递增会让下一轮 offset 偏小，
+                // 导致重复拉取并插入重复项。limit 固定 30，故 += 30。
+                strongSelf.currentResourcepackOffset += 30;
 
                 [strongSelf.resourcepackTableView reloadData];
                 strongSelf.emptyLabel.hidden = (strongSelf.resourcepackList.count > 0);
@@ -2333,7 +2349,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                 }
                 [strongSelf.datapackList addObjectsFromArray:results];
                 strongSelf.hasMoreDatapacks = (results.count >= 30);
-                strongSelf.currentDatapackOffset += results.count;
+                // offset 必须按「请求量」递增，不能按「返回条数」。results 是追加进
+                // 列表的批次，一旦某页返回数 < limit（末页 / 镜像截断 / 服务端
+                // clamp），用 results.count 递增会让下一轮 offset 偏小，
+                // 导致重复拉取并插入重复项。limit 固定 30，故 += 30。
+                strongSelf.currentDatapackOffset += 30;
 
                 [strongSelf.datapackTableView reloadData];
                 strongSelf.emptyLabel.hidden = (strongSelf.datapackList.count > 0);
@@ -2417,7 +2437,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                 }
                 [strongSelf.worldList addObjectsFromArray:results];
                 strongSelf.hasMoreWorlds = (results.count >= 30);
-                strongSelf.currentWorldOffset += results.count;
+                // offset 必须按「请求量」递增，不能按「返回条数」。results 是追加进
+                // 列表的批次，一旦某页返回数 < limit（末页 / 镜像截断 / 服务端
+                // clamp），用 results.count 递增会让下一轮 offset 偏小，
+                // 导致重复拉取并插入重复项。limit 固定 30，故 += 30。
+                strongSelf.currentWorldOffset += 30;
 
                 [strongSelf.worldTableView reloadData];
                 strongSelf.emptyLabel.hidden = (strongSelf.worldList.count > 0);

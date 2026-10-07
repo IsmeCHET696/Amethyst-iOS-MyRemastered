@@ -3,6 +3,48 @@
 #import "ModpackUtils.h"
 #import "PLMirrorCenter.h"
 
+#pragma mark - 解压路径穿越防护（zip-slip）
+
+/// 判断 zip 条目名是否可以安全写入 baseDir 下的相对路径。
+///
+/// 对齐 ZalithLauncher2 的 FileUtils.kt（L351-360）双层防护：
+///   1. 条目名里不得含 ".." 路径段 —— 直接拒绝；
+///   2. 归一化后必须仍在 baseDir 之内 —— 拦住 "a/../../b" 这类
+///      归一化前不含 ".."、归一化后才越界的写法。
+///
+/// @param fileName 已剥离包装根目录的条目相对路径
+/// @param baseDir  解压根目录（绝对路径）
+/// @return 安全的绝对目标路径；不安全时返回 nil
+static NSString *ameSafeZipDestination(NSString *fileName, NSString *baseDir) {
+    if (fileName.length == 0 || baseDir.length == 0) return nil;
+
+    // 统一分隔符：zip 规范用 '/'，但有些打包器会写 '\\'
+    NSString *normalizedEntry = [fileName stringByReplacingOccurrencesOfString:@"\\\\" withString:@"/"];
+
+    // 1) 拒绝任何 ".." 路径段（开头、中间、结尾都拦）
+    for (NSString *seg in [normalizedEntry componentsSeparatedByString:@"/"]) {
+        if ([seg isEqualToString:@".."]) {
+            NSLog(@"[ModpackDL] Rejected zip entry with path traversal segment: %@", fileName);
+            return nil;
+        }
+    }
+    // 绝对路径条目同样拒绝（"C:/..." 或 "/etc/..."）
+    if ([normalizedEntry hasPrefix:@"/"] || [normalizedEntry containsString:@":"]) {
+        NSLog(@"[MODPACK-SEC] Rejected absolute zip entry: %@", fileName);
+        return nil;
+    }
+
+    NSString *dest = [[baseDir stringByAppendingPathComponent:normalizedEntry] stringByStandardizingPath];
+    NSString *root = [baseDir stringByStandardizingPath];
+
+    // 2) 归一化后必须仍在根目录之内（含根目录本身）
+    if (![dest isEqualToString:root] && ![dest hasPrefix:[root stringByAppendingString:@"/"]]) {
+        NSLog(@"[MODPACK-SEC] Rejected zip entry escaping the extraction root: %@ -> %@", fileName, dest);
+        return nil;
+    }
+    return dest;
+}
+
 @implementation ModpackUtils
 
 + (void)archive:(UZKArchive *)archive extractDirectory:(NSString *)dir toPath:(NSString *)path error:(NSError *__autoreleasing*)error {
@@ -12,7 +54,12 @@
             return;
         }
         NSString *fileName = [fileInfo.filename substringFromIndex:dir.length+1];
-        NSString *destItemPath = [path stringByAppendingPathComponent:fileName];
+        // zip-slip 防护（见 ameSafeZipDestination）：此前是裸拼接，
+        // 含 ".." 的条目可写到解压根目录之外。nil 表示该条目不安全，跳过。
+        NSString *destItemPath = ameSafeZipDestination(fileName, path);
+        if (destItemPath == nil) {
+            return;
+        }
         NSString *destDirPath = fileInfo.isDirectory ? destItemPath : destItemPath.stringByDeletingLastPathComponent;
         BOOL createdDir = [NSFileManager.defaultManager createDirectoryAtPath:destDirPath
             withIntermediateDirectories:YES

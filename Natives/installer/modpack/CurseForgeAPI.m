@@ -1026,7 +1026,10 @@ static const NSInteger kCFAListAllSourcesFailedCode = 9002;
         });
         return;
     }
-    NSString *urlStr = [NSString stringWithFormat:@"%@/mods/%@/files", self.baseURL, modID];
+    // 分页：CF 该端点默认 pageSize=50，不传参数时大项目（文件数 > 50）的
+    // 早期版本永远拉不到。这里显式请求全部（与同文件 L1136 的写法一致）。
+    // 服务端会把超大 pageSize clamp 到上限，返回 totalCount 供调用方判断。
+    NSString *urlStr = [NSString stringWithFormat:@"%@/mods/%@/files?pageSize=10000", self.baseURL, modID];
     NSURL *url = [NSURL URLWithString:urlStr];
     if (!url) {
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{
