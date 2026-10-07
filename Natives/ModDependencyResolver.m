@@ -21,8 +21,8 @@
 //
 
 #import "ModDependencyResolver.h"
-#import "ModrinthAPI.h"
-#import "CurseForgeAPI.h"
+#import "installer/modpack/ModrinthAPI.h"
+#import "installer/modpack/CurseForgeAPI.h"
 
 /// 同时进行的前置查询数。ZL2 用 4，这里保持一致：
 /// 太低会让链式依赖解析很慢，太高容易触发源站限流。
