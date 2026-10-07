@@ -538,6 +538,7 @@ add_executable(AngelAuraAmethyst
   MarqueeLabel.m
   ModItem.m
   ModService.m
+  ModDependencyResolver.m
   ModTableViewCell.m
   ModTableViewController.m
   ModsManagerViewController.m
