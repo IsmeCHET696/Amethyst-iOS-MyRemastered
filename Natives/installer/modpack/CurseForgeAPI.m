@@ -83,6 +83,23 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
 /// ★ [MODSRC-LIST] 全部候选源均失败时的错误码。
 static const NSInteger kCFAListAllSourcesFailedCode = 9002;
 
+#pragma mark - modLoaderType 映射（CurseForge 端筛选）
+
+/// 把统一的 loader 名映射到 CurseForge 的 modLoaderType 枚举值。
+///
+/// CF 的取值：1=Fabric / 2=Forge(旧) / 3=Quilt / 4=Forge / 5=NeoForge（官方文档）。
+/// 这里与 ZalithLauncher2 的 ModLoaderType 保持一致：Forge 用 4。
+/// 无法识别时返回 0（不发送该参数），保持旧行为。
+static NSInteger CFAModLoaderTypeForLoader(NSString *loader) {
+    if (![loader isKindOfClass:[NSString class]] || loader.length == 0) return 0;
+    NSString *l = loader.lowercaseString;
+    if ([l containsString:@"fabric"])   return 1;
+    if ([l containsString:@"quilt"])    return 3;
+    if ([l containsString:@"neoforge"]) return 5;
+    if ([l containsString:@"forge"])    return 4;
+    return 0;
+}
+
 @implementation CurseForgeAPI
 
 /// 重写 baseURL getter，根据 PLMirrorCenter 的资源搜索（AssetSearch）策略
@@ -471,6 +488,17 @@ static const NSInteger kCFAListAllSourcesFailedCode = 9002;
 }
 
 - (NSMutableDictionary *)projectFromCurseForgeProject:(NSDictionary *)project projectType:(NSString *)projectType {
+    // ★ [MODSRC-APPROVED] 过审门控：CF 的搜索结果服务端已过滤未过审项目，但
+    //   详情/文件接口（mods/{id} / mods/{id}/files）会返回被下架或隐藏的项目。
+    //   之前 iOS 侧完全不看 isAvailable，于是这类项目照常出现在列表里，
+    //   用户点进去下载必然 404，且报的是网络错误而非「项目不可用」。
+    //   这里与 ZalithLauncher2 的 isApproved() 门控对齐：字段存在且明确为
+    //   false 时判定不可用，返回 nil 由调用方跳过（字段缺失时不拦，避免
+    //   旧接口/镜像缺字段导致整列表为空）。
+    id available = project[@"isAvailable"];
+    if ([available isKindOfClass:[NSNumber class]] && ![available boolValue]) {
+        return nil;
+    }
     NSString *title = project[@"name"];
     NSString *description = project[@"summary"];
     return @{
@@ -610,7 +638,9 @@ static const NSInteger kCFAListAllSourcesFailedCode = 9002;
     NSArray *projects = [response[@"data"] isKindOfClass:NSArray.class] ? response[@"data"] : @[];
     for (NSDictionary *project in projects) {
         if (![project isKindOfClass:NSDictionary.class]) continue;
-        [result addObject:[self projectFromCurseForgeProject:project projectType:projectType]];
+        NSMutableDictionary *mapped = [self projectFromCurseForgeProject:project projectType:projectType];
+        if (mapped == nil) continue;   // 未过审/已下架，跳过
+        [result addObject:mapped];
     }
     
     NSDictionary *pagination = [response[@"pagination"] isKindOfClass:NSDictionary.class] ? response[@"pagination"] : @{};
@@ -727,6 +757,34 @@ static const NSInteger kCFAListAllSourcesFailedCode = 9002;
     }
     if (mcVersion.length > 0) {
         [pathQuery appendFormat:@"&gameVersion=%@", mcVersion];
+    }
+    // ★ [MODSRC-LOADER] 加载器筛选：此前 CF 端完全不发送 modLoaderType，
+    //   界面上的「Fabric/Forge/NeoForge/Quilt」选择对 CF 源等同无效 ——
+    //   只能靠 gameVersion 后缀在服务端模糊匹配，常常一个加载器的 mod
+    //   和另一个混在一起，用户装错后启动即崩。
+    //   Modrinth 端一直有 loader facet，这里补齐 CF 的对应能力。
+    NSInteger loaderType = CFAModLoaderTypeForLoader(filters[@"loader"]);
+    if (loaderType > 0) {
+        [pathQuery appendFormat:@"&modLoaderType=%ld", (long)loaderType];
+    }
+    // ★ [MODSRC-CATEGORY] 分类筛选：CF 支持多值，格式为 categoryIds=[1,2,3]。
+    //   此前完全没发送，界面上的分类选择对 CF 源无效。
+    id categoryIds = filters[@"categoryIds"] ?: filters[@"categoryId"];
+    if (categoryIds != nil) {
+        if ([categoryIds isKindOfClass:[NSArray class]]) {
+            NSArray *arr = (NSArray *)categoryIds;
+            if (arr.count > 0) {
+                NSMutableArray<NSString *> *parts = [NSMutableArray new];
+                for (id c in arr) {
+                    if ([c respondsToSelector:@selector(integerValue)]) [parts addObject:[NSString stringWithFormat:@"%ld", (long)[c integerValue]]];
+                }
+                if (parts.count > 0) {
+                    [pathQuery appendFormat:@"&categoryIds=[%@]", [parts componentsJoinedByString:@","]];
+                }
+            }
+        } else if ([categoryIds respondsToSelector:@selector(integerValue)]) {
+            [pathQuery appendFormat:@"&categoryIds=[%ld]", (long)[categoryIds integerValue]];
+        }
     }
 
     // ★ [MODSRC-LIST] 候选链：官方 ↔ MCIM 镜像交叉回退；无 key 时把镜像提到最前

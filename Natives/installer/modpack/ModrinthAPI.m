@@ -61,6 +61,68 @@ static NSString *ameMCVersionsDisplayString(NSArray *gameVersions) {
     return [NSString stringWithFormat:@"%@ +%lu", vers.firstObject, (unsigned long)(vers.count - 1)];
 }
 
+#pragma mark - 中文搜索关键词映射
+
+/// 中文（及少量简写）→ 英文检索词。
+///
+/// Modrinth 的搜索索引以英文为主，直接提交中文关键词通常返回空结果，
+/// 界面会显示「暂无」，用户容易误判为源不可用。对照 ZalithLauncher2 的
+/// localizedModSearchKeywords，这里维护一份启动器用户的高频词映射。
+/// 保持「命中才替换」的策略：未命中时原样返回，不劣化现状。
+static NSString *ameLocalizedSearchKeyword(NSString *query) {
+    if (![query isKindOfClass:[NSString class]] || query.length == 0) return query;
+
+    // 按键长降序匹配，避免「光影」先被「光」之类的短键吃掉。
+    static NSArray<NSArray<NSString *> *> *table = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        table = @[
+            // 性能 / 优化
+            @[@"优化", @"optimization"], @[@"性能", @"performance"],
+            @[@"帧数", @"fps"], @[@"流畅", @"performance"],
+            @[@"钠", @"sodium"], @[@"锂", @"lithium"], @[@"磷", @"phosphor"],
+            @[@"铟", @"indium"], @[@"钾", @"potassium"],
+            // 光影 / 视觉
+            @[@"光影", @"shader"], @[@"着色器", @"shader"],
+            @[@"材质", @"resource pack"], @[@"材质包", @"resource pack"],
+            @[@"资源包", @"resource pack"], @[@"天空", @"sky"],
+            @[@"水面", @"water"], @[@"动态光源", @"dynamic lights"],
+            // 玩法 / 内容
+            @[@"地图", @"map"], @[@"小地图", @"minimap"],
+            @[@"机械", @"technology"], @[@"科技", @"technology"],
+            @[@"魔法", @"magic"], @[@"工业", @"industrial"],
+            @[@"自动化", @"automation"], @[@"能源", @"energy"],
+            @[@"生存", @"survival"], @[@"冒险", @"adventure"],
+            @[@"建筑", @"building"], @[@"装饰", @"decoration"],
+            @[@"家具", @"furniture"], @[@"食物", @"food"],
+            @[@"农业", @"farming"], @[@"钓鱼", @"fishing"],
+            // 实用
+            @[@"背包", @"inventory"], @[@"合成", @"crafting"],
+            @[@"整理", @"sorting"], @[@"储物", @"storage"],
+            @[@"任务", @"quest"], @[@"技能", @"skill"],
+            @[@"血量", @"health"], @[@"生命", @"health"],
+            @[@"生物", @"mob"], @[@"怪物", @"monster"],
+            @[@"敌人", @"enemy"], @[@"boss", @"boss"],
+            @[@"村民", @"villager"], @[@"村庄", @"village"],
+            @[@"维度", @"dimension"], @[@"传送", @"teleport"],
+            @[@"附魔", @"enchant"], @[@"药水", @"potion"],
+            // 其它
+            @[@"汉化", @"chinese"], @[@"中文", @"chinese"],
+            @[@"优化模组", @"optimization mod"],
+            @[@"辅助", @"utility"], @[@"工具", @"utility"],
+            @[@"联机", @"multiplayer"], @[@"服务器", @"server"],
+        ];
+    });
+
+    for (NSArray<NSString *> *pair in table) {
+        if ([query containsString:pair[0]]) {
+            NSLog(@"[ModrinthAPI] localized search keyword: '%@' -> '%@'", query, pair[1]);
+            return pair[1];
+        }
+    }
+    return query;
+}
+
 @implementation ModrinthAPI
 
 @dynamic reachedLastPage, lastError;
@@ -337,7 +399,7 @@ static NSString *ameMCVersionsDisplayString(NSArray *gameVersions) {
         // 防御性回退：未指定 projectType 但声明 isModpack 时按整合包搜索，避免误搜 Mod
         projectType = [filters[@"isModpack"] boolValue] ? @"modpack" : @"mod";
     }
-    NSString *query = filters[@"query"] ?: filters[@"name"] ?: @"";
+    NSString *query = ameLocalizedSearchKeyword(filters[@"query"] ?: filters[@"name"] ?: @"");
     NSNumber *limitNum = filters[@"limit"] ?: @50;
     int limit = [limitNum intValue];
     NSNumber *offsetNum = filters[@"offset"] ?: @0;
@@ -552,7 +614,7 @@ static NSString *ameMCVersionsDisplayString(NSArray *gameVersions) {
 - (void)_searchServerWithProjectType:(NSString *)projectType
                               filters:(NSDictionary *)filters
                            completion:(void (^)(NSArray * _Nullable, NSError * _Nullable))completion {
-    NSString *query = filters[@"query"] ?: filters[@"name"] ?: @"";
+    NSString *query = ameLocalizedSearchKeyword(filters[@"query"] ?: filters[@"name"] ?: @"");
     NSNumber *limitNum = filters[@"limit"] ?: @30;
     int limit = [limitNum intValue];
     NSNumber *offsetNum = filters[@"offset"] ?: @0;
