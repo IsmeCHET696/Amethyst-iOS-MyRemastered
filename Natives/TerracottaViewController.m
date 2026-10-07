@@ -64,6 +64,9 @@ static const CGFloat kBlockSpacing     = 16.0;
 
 #pragma mark 已连接态
 @property(nonatomic, strong) UIStackView *connectedStack;
+@property(nonatomic, strong) UIButton *copyCodeButton;
+@property(nonatomic, strong) UIButton *copyURLButton;
+@property(nonatomic, strong) UILabel  *roomCodeCaptionLabel;
 @property(nonatomic, strong) UILabel     *roomCodeLabel;
 @property(nonatomic, strong) UILabel     *directURLLabel;
 @property(nonatomic, strong) UIStackView *playerListStack;
@@ -311,17 +314,16 @@ static const CGFloat kBlockSpacing     = 16.0;
     self.directURLLabel.numberOfLines = 0;
     self.directURLLabel.hidden = YES;
 
-    UIButton *copyCode = [self makeSecondaryButtonWithTitle:localize(@"terracotta_copy_code", nil)
-                                                    action:@selector(copyRoomCodeTapped)];
-    copyCode.hidden = YES;   // 由 refreshUI 按角色决定是否显示
+    self.copyCodeButton = [self makeSecondaryButtonWithTitle:localize(@"terracotta_copy_code", nil)
+                                                       action:@selector(copyRoomCodeTapped)];
+    self.copyCodeButton.hidden = YES;   // 由 refreshUI 按角色决定是否显示
+    self.roomCodeCaptionLabel = codeCaption;
     self.roomCodeLabel.hidden = YES;
     codeCaption.hidden = YES;
-    [self bindCopyCodeButton:copyCode];
 
-    UIButton *copyURL = [self makeSecondaryButtonWithTitle:localize(@"terracotta_copy_url", nil)
-                                                   action:@selector(copyDirectURLTapped)];
-    copyURL.hidden = YES;
-    [self bindCopyURLButton:copyURL];
+    self.copyURLButton = [self makeSecondaryButtonWithTitle:localize(@"terracotta_copy_url", nil)
+                                                     action:@selector(copyDirectURLTapped)];
+    self.copyURLButton.hidden = YES;
 
     // 玩家列表（标题 + 动态行）
     UILabel *playersTitle = [self makeLabelWithFont:[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]
@@ -336,7 +338,7 @@ static const CGFloat kBlockSpacing     = 16.0;
 
     self.connectedStack = [[UIStackView alloc] initWithArrangedSubviews:@[
         codeCaption, self.roomCodeLabel, self.directURLLabel,
-        copyCode, copyURL, playersTitle, self.playerListStack,
+        self.copyCodeButton, self.copyURLButton, playersTitle, self.playerListStack,
     ]];
     self.connectedStack.translatesAutoresizingMaskIntoConstraints = NO;
     self.connectedStack.axis = UILayoutConstraintAxisVertical;
@@ -446,13 +448,12 @@ static const CGFloat kBlockSpacing     = 16.0;
         NSString *code = mgr.currentInviteCode;
         self.roomCodeLabel.hidden = (code.length == 0);
         self.roomCodeLabel.text = code ?: @"";
-        NSArray<UIView *> *connectedViews = self.connectedStack.arrangedSubviews;
-        // [0]=codeCaption [1]=roomCode [2]=directURL [3]=copyCode [4]=copyURL
-        connectedViews[0].hidden = !isHost || code.length == 0;
-        ((UIButton *)connectedViews[3]).hidden = !isHost || code.length == 0;
+        // 用属性引用而不是 arrangedSubviews 下标，避免布局调整后错位。
+        self.roomCodeCaptionLabel.hidden = !isHost || code.length == 0;
+        self.copyCodeButton.hidden = !isHost || code.length == 0;
         self.directURLLabel.hidden = isHost || mgr.directConnectURL.length == 0;
         self.directURLLabel.text = mgr.directConnectURL ?: @"";
-        ((UIButton *)connectedViews[4]).hidden = isHost || mgr.directConnectURL.length == 0;
+        self.copyURLButton.hidden = isHost || mgr.directConnectURL.length == 0;
         [self refreshPlayerList];
     }
 
