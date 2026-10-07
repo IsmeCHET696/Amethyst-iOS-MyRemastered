@@ -518,7 +518,7 @@ static const NSInteger kCFAListAllSourcesFailedCode = 9002;
         return @"";
     }
     NSString *encodedName = [fileName stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
-    NSString *cdnURL = [NSString stringWithFormat:@"https://edge.forgecdn.net/files/%ld/%03ld/%@",
+    NSString *cdnURL = [NSString stringWithFormat:@"https://edge.forgecdn.net/files/%ld/%ld/%@",
             (long)(numericFileId / 1000),
             (long)(numericFileId % 1000),
             encodedName ?: fileName];
@@ -544,7 +544,7 @@ static const NSInteger kCFAListAllSourcesFailedCode = 9002;
         return file;
     }
     NSString *encodedName = [fileName stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet] ?: fileName;
-    NSString *cdnURL = [NSString stringWithFormat:@"https://edge.forgecdn.net/files/%ld/%03ld/%@",
+    NSString *cdnURL = [NSString stringWithFormat:@"https://edge.forgecdn.net/files/%ld/%ld/%@",
                         (long)(numericId / 1000), (long)(numericId % 1000), encodedName];
     NSMutableDictionary *patched = [file mutableCopy];
     patched[@"downloadUrl"] = CFAMirrorResolvedURL(cdnURL);

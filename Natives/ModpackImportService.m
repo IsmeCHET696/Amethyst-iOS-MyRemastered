@@ -1805,7 +1805,7 @@ static NSString *ameSafeZipDestination(NSString *fileName, NSString *baseDir) {
                 if (hasRealFileName) {
                     NSString *encodedName = [fileName stringByAddingPercentEncodingWithAllowedCharacters:
                                              NSCharacterSet.URLPathAllowedCharacterSet];
-                    NSURL *edgeURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://edge.forgecdn.net/files/%lld/%03lld/%@",
+                    NSURL *edgeURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://edge.forgecdn.net/files/%lld/%lld/%@",
                                                            fileID / 1000, fileID % 1000, encodedName ?: fileName]];
                     if (edgeURL) {
                         for (NSURL *u in [PLMirrorCenter candidateURLsForOriginalURL:edgeURL

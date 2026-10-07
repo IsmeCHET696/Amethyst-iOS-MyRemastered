@@ -39,6 +39,28 @@ static NSError *MRAMListRequestError(NSArray<NSString *> *failures) {
                     completion:(void (^)(NSArray * _Nullable results, NSError * _Nullable error))completion;
 @end
 
+/// 把一个 Modrinth 版本支持的 MC 版本数组拼成界面可读的字符串。
+///
+/// 此前只取 game_versions.firstObject，导致「支持 1.20.1/1.20.2/1.20.4」的版本
+/// 在列表里只显示 1.20.1 —— 用户会以为它不支持自己正在用的 1.20.4，
+/// 从而挑错版本甚至放弃安装。
+///
+/// 保持原平行数组结构不变（mcVersionNames 仍与 versionNames 一一对应），
+/// 只把单个字符串换成「多版本拼接」：超过 3 个时折叠为「首个 +N」，
+/// 避免把列表行撑开。
+static NSString *ameMCVersionsDisplayString(NSArray *gameVersions) {
+    if (![gameVersions isKindOfClass:[NSArray class]] || gameVersions.count == 0) {
+        return @"";
+    }
+    NSMutableArray<NSString *> *vers = [NSMutableArray new];
+    for (id v in gameVersions) {
+        if ([v isKindOfClass:[NSString class]] && [v length] > 0) [vers addObject:v];
+    }
+    if (vers.count == 0) return @"";
+    if (vers.count <= 3) return [vers componentsJoinedByString:@"/"];
+    return [NSString stringWithFormat:@"%@ +%lu", vers.firstObject, (unsigned long)(vers.count - 1)];
+}
+
 @implementation ModrinthAPI
 
 @dynamic reachedLastPage, lastError;
@@ -149,7 +171,7 @@ static NSError *MRAMListRequestError(NSArray<NSString *> *failures) {
 
         [names addObject:version[@"name"] ?: @"Unknown"];
         NSArray *gameVersions = version[@"game_versions"];
-        [mcNames addObject:[gameVersions isKindOfClass:[NSArray class]] ? gameVersions.firstObject : @""];
+        [mcNames addObject:ameMCVersionsDisplayString(gameVersions)];
         [urls addObject:file[@"url"] ?: @""];
         NSDictionary *hashesMap = file[@"hashes"];
         [hashes addObject:hashesMap[@"sha1"] ?: @""];
@@ -232,7 +254,7 @@ static NSError *MRAMListRequestError(NSArray<NSString *> *failures) {
 
             [names addObject:version[@"name"] ?: @"Unknown"];
             NSArray *gameVersions = version[@"game_versions"];
-            [mcNames addObject:[gameVersions isKindOfClass:[NSArray class]] ? gameVersions.firstObject : @""];
+            [mcNames addObject:ameMCVersionsDisplayString(gameVersions)];
             [urls addObject:MRAMirrorResolvedURL(file[@"url"] ?: @"")];
             NSDictionary *hashesMap = file[@"hashes"];
             [hashes addObject:hashesMap[@"sha1"] ?: @""];
