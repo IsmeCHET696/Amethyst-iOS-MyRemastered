@@ -360,8 +360,36 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         // 因为 JavaLauncher.m 已通过 -Dorg.lwjgl.opengl.libname=mobileglues（裸名）设置
         if (setLwjglProperty) JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
         // 跳过下方的统一 JNI_LWJGL_changeRenderer 和 dlopen（已处理）
-        return pojavFinishOpenGLInit(!br_init());
+        if (br_init == NULL) {
+        NSLog(@"[egl_bridge] FATAL: br_init is NULL for renderer=%@ -- refusing to "
+              @"call through a NULL pointer", renderer);
+        return pojavFinishOpenGLInit(1);
     }
+    if (br_init == NULL) {
+        NSLog(@"[egl_bridge] FATAL: br_init is NULL for renderer=%@ -- refusing to "
+              @"call through a NULL pointer", renderer);
+        return pojavFinishOpenGLInit(1);
+    }
+    return pojavFinishOpenGLInit(!br_init());
+    }
+    // 兜底：渲染器名未命中任何分支（用户手改 video.renderer、旧 profile
+    // 遗留、第三方 fork 写入的自定义 dylib 名等）。此时所有
+    // set_*_bridge_tbl() 都没被调用，而 bridge_tbl.h 里的 br_init /
+    // br_init_context 是未初始化的全局函数指针（C 全局零初始化 = NULL），
+    // 函数末尾的 !br_init() 会解引用 NULL 直接崩溃。
+    //
+    // 对照 ZL2：Renderers.setCurrentRenderer(id, retryToFirstOnFailure=true)
+    // 未命中会回落列表首个，结构上不可能出现「无渲染器」状态。
+    // 这里同样回落到 ANGLE（内置、无需额外 dylib、覆盖面最广）。
+    if (br_init == NULL) {
+        NSLog(@"[egl_bridge] unknown renderer '%@' -- falling back to %s "
+              @"(no bridge table was selected)",
+              renderer, RENDERER_NAME_MTL_ANGLE);
+        renderer = @ RENDERER_NAME_MTL_ANGLE;
+        setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+        set_gl_bridge_tbl();
+    }
+
     // SFPEW 叠加在 MobileGL(-gles) 上时 AMETHYST_RENDERER 是 SFPEW，但真后端仍是
     // MobileGL —— MOBILEGL_BACKEND_TYPE 必须保留，否则后端选成默认的 DirectVulkan。
     const char *sfpewBackend = getenv("AMETHYST_SFPEW_BACKEND");
@@ -434,6 +462,16 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         dlopen(rpath.UTF8String, dlFlags);
     }
 
+    if (br_init == NULL) {
+        NSLog(@"[egl_bridge] FATAL: br_init is NULL for renderer=%@ -- refusing to "
+              @"call through a NULL pointer", renderer);
+        return pojavFinishOpenGLInit(1);
+    }
+    if (br_init == NULL) {
+        NSLog(@"[egl_bridge] FATAL: br_init is NULL for renderer=%@ -- refusing to "
+              @"call through a NULL pointer", renderer);
+        return pojavFinishOpenGLInit(1);
+    }
     return pojavFinishOpenGLInit(!br_init());
     //return 0;
 }

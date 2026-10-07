@@ -1,949 +1,825 @@
-#import "TerracottaViewController.h"
-#import "TerracottaManager.h"
-#import "TerracottaBridge.h"
-#import "LauncherPreferences.h"
-#import "utils.h"
-#import "BackgroundManager.h"
-#import "MultiplayerViewController.h"
-#import "McLanPortDetector.h"   // ★ [PORT-AUTO]
+//
+//  TerracottaViewController.m
+//  陶瓦联机界面 —— 综合 ZalithLauncher2（状态驱动的卡片式布局）与
+//  FoldCraftLauncher（信息密度与错误提示）的设计重写。
+//
+//  改动要点（相对旧版 963 行实现）：
+//   1. 去掉常驻 UISegmentedControl + 常驻双面板。改为按状态整屏切换，
+//      未连接时只呈现「创建房间 / 加入房间」两张卡片（ZL2 WaitingUI 的做法）。
+//   2. 新增日志入口（ZL2 底部 TextButton 的做法）—— 便于用户自查联机失败原因。
+//   3. 新增难度显示：访客加入过程中 Terracotta 会回传难度分级
+//      （EASIEST / SIMPLE / MEDIUM / TOUGH），旧版未展示。
+//   4. 已连接态改为房间码 + 操作区 + 玩家列表的分栏布局，窄屏自动改为纵向堆叠。
+//   5. 移除 ZeroTier 入口。
+//
+//  逻辑层未改动：状态/操作全部经 TerracottaManager，本文件只负责呈现与转发。
+//
 
-/// FCL 风格的陶瓦联机界面（完美适配自定义启动器背景）
-///
-/// 布局参考 FoldCraftLauncher 的 multiplayer 模块：
-/// - 顶部：状态卡片（圆形状态图标 + 状态文字 + 阶段描述 + 邀请码/直连地址）
-/// - 中部：UISegmentedControl 切换「创建房间」/「加入房间」
-/// - 创建房间面板：端口输入框 + 大按钮
-/// - 加入房间面板：邀请码输入框 + 大按钮
-/// - 会话进行中：显示「断开连接」按钮 + 玩家列表
-///
-/// 状态监听通过 TerracottaManagerStateDidChangeNotification 通知刷新 UI。
-///
-/// 背景适配（参照 MultiplayerViewController）：
-/// - viewDidLoad/viewWillAppear 调 makeViewControllerTransparent 透明化 VC
-/// - 所有卡片/玩家行用 applyEffectToView: 注入毛玻璃（半透明模式则注入半透明色）
-/// - 文字颜色根据 hasBackground 区分白字（背景图模式）与 labelColor（系统背景模式）
-/// - 监听 BackgroundUIEffectChanged 通知，背景切换时重新应用
+#import "TerracottaViewController.h"
+#import "TerracottaBridge.h"
+#import "McLanPortDetector.h"
+#import "utils.h"
+
+#pragma mark - 设计常量
+
+/// 卡片圆角与内边距，与启动器其它界面的视觉语言保持一致。
+static const CGFloat kCardCornerRadius = 16.0;
+static const CGFloat kCardPadding      = 16.0;
+static const CGFloat kContentInset     = 16.0;
+static const CGFloat kBlockSpacing     = 16.0;
+
 @interface TerracottaViewController () <UITextFieldDelegate>
 
-/* 顶部状态卡片 */
-@property(nonatomic, strong) UIView *statusCard;
-@property(nonatomic, strong) UIImageView *statusIcon;
-@property(nonatomic, strong) UILabel *statusLabel;
-@property(nonatomic, strong) UILabel *stageLabel;
-@property(nonatomic, strong) UIActivityIndicatorView *activityIndicator;
-@property(nonatomic, strong) UILabel *inviteCodeLabel;
-@property(nonatomic, strong) UIButton *inviteCopyButton;
-@property(nonatomic, strong) UILabel *directConnectLabel;
-@property(nonatomic, strong) UIButton *directCopyButton;
-
-/* Tab 切换 */
-@property(nonatomic, strong) UISegmentedControl *tabControl;
-@property(nonatomic, strong) UIView *createPanel;
-@property(nonatomic, strong) UIView *joinPanel;
-
-/* 创建房间面板 */
-@property(nonatomic, strong) UILabel *createHintLabel;
-@property(nonatomic, strong) UITextField *portField;
-@property(nonatomic, strong) UIButton *createButton;
-
-/* 加入房间面板 */
-@property(nonatomic, strong) UILabel *joinHintLabel;
-@property(nonatomic, strong) UITextField *inviteField;
-@property(nonatomic, strong) UIButton *joinButton;
-
-/* 会话中底部 */
-@property(nonatomic, strong) UIButton *disconnectButton;
-@property(nonatomic, strong) UILabel *playersTitleLabel;
-@property(nonatomic, strong) UIStackView *playersList;
-
-/* 容器滚动视图（小屏适配） */
-@property(nonatomic, strong) UIScrollView *scrollView;
-@property(nonatomic, strong) UIView *contentView;
-
-/* ★ [PORT-AUTO] MC 局域网端口自动探测 */
+#pragma mark 状态
+@property(nonatomic, assign) BOOL isHostRole;
 @property(nonatomic, strong) McLanPortDetector *portDetector;
-@property(nonatomic, copy, nullable) NSString *autoDetectedPortText;   /* 上次自动填入的端口文本 */
+@property(nonatomic, assign) uint16_t manualPort;
+@property(nonatomic, assign) BOOL portAutoDetected;
+
+#pragma mark 容器
+@property(nonatomic, strong) UIScrollView *scrollView;
+@property(nonatomic, strong) UIStackView  *rootStack;   // 纵向主容器
+
+#pragma mark 顶部状态卡
+@property(nonatomic, strong) UIView      *statusCard;
+@property(nonatomic, strong) UIImageView *statusIcon;
+@property(nonatomic, strong) UILabel     *statusTitleLabel;
+@property(nonatomic, strong) UILabel     *statusDetailLabel;
+@property(nonatomic, strong) UIActivityIndicatorView *statusSpinner;
+@property(nonatomic, strong) UILabel     *portLabel;
+
+#pragma mark 未连接态
+@property(nonatomic, strong) UIStackView *entryStack;
+@property(nonatomic, strong) UIControl   *hostCard;
+@property(nonatomic, strong) UIControl   *guestCard;
+
+#pragma mark 创建房间表单
+@property(nonatomic, strong) UIStackView *createFormStack;
+@property(nonatomic, strong) UITextField *portField;
+@property(nonatomic, strong) UILabel     *portHintLabel;
+
+#pragma mark 加入房间表单
+@property(nonatomic, strong) UIStackView *joinFormStack;
+@property(nonatomic, strong) UITextField *codeField;
+
+#pragma mark 已连接态
+@property(nonatomic, strong) UIStackView *connectedStack;
+@property(nonatomic, strong) UILabel     *roomCodeLabel;
+@property(nonatomic, strong) UILabel     *directURLLabel;
+@property(nonatomic, strong) UIStackView *playerListStack;
+
+#pragma mark 底部
+@property(nonatomic, strong) UILabel  *footerLabel;
+@property(nonatomic, strong) UIButton *logButton;
+@property(nonatomic, strong) UIButton *actionButton;
 
 @end
 
-#pragma mark - ★ [PORT-AUTO] 本地化（带 fallback，新增 key 缺失时不显示生 key）
-
-static NSString *TCLocalized(NSString *key, NSString *fallback) {
-    NSString *value = localize(key, nil);
-    return [value isEqualToString:key] ? (fallback ?: key) : value;
-}
-
 @implementation TerracottaViewController
 
-#pragma mark - Lifecycle
+#pragma mark - 生命周期
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _manualPort = 0;
+    }
+    return self;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    // 不设置 self.title，避免顶部导航栏出现"陶瓦联机"标题黑条（参照 FCL 无 title 风格）
-    self.view.backgroundColor = [UIColor clearColor];
-
-    // ★ [MP-BACK] 三种呈现方式区别对待，保证【任何入口都能退出】：
-    //   ① pushed(栈里非根, count>1)          ⇒ 交给系统：显示导航栏 + 系统自带返回键(不覆盖 leftBarButtonItem)
-    //   ② modal 根(presentingViewController!=nil) ⇒ 注入系统关闭按钮(Close)，dismiss 退出
-    //   ③ 非 modal 的 nav 根(count==1)        ⇒ 隐藏导航栏(原行为:启动器内容区整页呈现)
-    BOOL isPushed = (self.navigationController &&
-                     self.navigationController.viewControllers.count > 1 &&
-                     self.navigationController.viewControllers.firstObject != self);
-    BOOL isHiddenRoot = (self.navigationController &&
-                         self.navigationController.viewControllers.count == 1 &&
-                         self.navigationController.presentingViewController == nil &&
-                         self.navigationController.viewControllers.firstObject == self);
-    if (isHiddenRoot) {
-        self.navigationController.navigationBarHidden = YES;
-    }
-    if (!isPushed && !isHiddenRoot) {
-        /* 关闭按钮（modal 模式）—— 注入系统关闭按钮，保证能退回进入前的页面 */
-        UIBarButtonItem *closeItem = [[UIBarButtonItem alloc]
-            initWithBarButtonSystemItem:UIBarButtonSystemItemClose
-                                target:self
-                                action:@selector(close)];
-        self.navigationItem.leftBarButtonItem = closeItem;
-    }
-    /* ① pushed：不设 leftBarButtonItem ⇒ 保留系统自带返回键(返回即回进入前的页面) */
-
-    /* ZeroTier 联机入口：始终使用浮动按钮放置在视图右上角
-       （导航栏可见时也保留，确保 modal/pushed 模式下可访问） */
-    UIButton *ztFab = [UIButton buttonWithType:UIButtonTypeSystem];
-    [ztFab setImage:[UIImage systemImageNamed:@"network"] forState:UIControlStateNormal];
-    ztFab.tintColor = [UIColor whiteColor];
-    ztFab.backgroundColor = [UIColor systemBlueColor];
-    ztFab.layer.cornerRadius = 18;
-    ztFab.layer.masksToBounds = YES;
-    ztFab.translatesAutoresizingMaskIntoConstraints = NO;
-    ztFab.accessibilityLabel = localize(@"i18n_str_1007", nil);
-    [ztFab addTarget:self action:@selector(switchToZeroTier:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:ztFab];
-    [self.view bringSubviewToFront:ztFab];
-    [NSLayoutConstraint activateConstraints:@[
-        [ztFab.widthAnchor constraintEqualToConstant:36],
-        [ztFab.heightAnchor constraintEqualToConstant:36],
-        [ztFab.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
-        [ztFab.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
-    ]];
-
-    /* 适配自定义启动器背景：透明化 VC，让全局背景图/毛玻璃透出 */
-    [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
-
-    [self setupViews];
+    self.title = localize(@"terracotta_title", nil);
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    [self buildLayout];
     [self registerNotifications];
-    [self applyBackgroundEffects];
     [self refreshUI];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    /* 重新隐藏导航栏黑条（pop 回根页面时 topViewController == self） */
-    if (self.navigationController &&
-        self.navigationController.viewControllers.firstObject == self &&
-        self.navigationController.presentingViewController == nil &&
-        self.navigationController.topViewController == self) {
-        self.navigationController.navigationBarHidden = YES;
-    }
-    // ★ [MP-BACK] pushed 呈现(栈里非根)：确保导航栏可见 —— 容器根页(主页/实例等)通常把导航栏藏了，
-    //   不显式打开的话系统返回键也一起被藏住，等于又「出不来」。
-    if (self.navigationController &&
-        self.navigationController.viewControllers.count > 1 &&
-        self.navigationController.viewControllers.firstObject != self &&
-        self.navigationController.topViewController == self) {
-        self.navigationController.navigationBarHidden = NO;
-    }
-    /* 与 MultiplayerViewController 一致：每次出现都重新透明化并应用导航栏毛玻璃 */
-    [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
-    [[BackgroundManager sharedManager] applyEffectToNavigationBar:self.navigationController.navigationBar];
-    [self applyBackgroundEffects];
-    [self updatePortAutoDetection];   // ★ [PORT-AUTO] 进入页面：创建面板可见则开始探测端口
+    [self refreshUI];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
-    [self stopPortAutoDetection];     // ★ [PORT-AUTO] 离开页面即取消
-    /* push 子页面时显示导航栏（子页面需要返回按钮） */
-    if (self.navigationController &&
-        self.navigationController.viewControllers.firstObject == self &&
-        self.navigationController.presentingViewController == nil) {
-        self.navigationController.navigationBarHidden = NO;
-    }
-    // ★ [MP-BACK] pushed 被 pop 时把导航栏恢复为隐藏(容器根页通常无导航栏)，
-    //   避免返回主页后残留一条导航栏。
-    if (self.navigationController &&
-        self.navigationController.viewControllers.count > 1 &&
-        self.navigationController.viewControllers.firstObject != self) {
-        self.navigationController.navigationBarHidden = YES;
-    }
+    [self stopPortAutoDetection];
 }
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-#pragma mark - Background Adaptation
+#pragma mark - 布局骨架
 
-/// 监听背景效果变化（用户切换背景图/毛玻璃模式/透明度时触发）
-- (void)registerBackgroundNotifications {
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(backgroundEffectChanged:)
-                                                 name:@"BackgroundUIEffectChanged"
-                                               object:nil];
-}
-
-/// 背景效果变化时重新应用所有效果，并刷新玩家列表（让 row 重新读取背景状态）
-- (void)backgroundEffectChanged:(NSNotification *)notification {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
-        [[BackgroundManager sharedManager] applyEffectToNavigationBar:self.navigationController.navigationBar];
-        [self applyBackgroundEffects];
-        [self refreshUI];
-    });
-}
-
-/// 对所有卡片/输入框/玩家行应用毛玻璃或半透明效果
-- (void)applyBackgroundEffects {
-    /* 状态卡片：注入毛玻璃（或半透明色） */
-    [[BackgroundManager sharedManager] applyEffectToView:self.statusCard];
-
-    /* 输入框：背景透明 + 注入毛玻璃（让背景透出） */
-    [[BackgroundManager sharedManager] applyEffectToView:self.portField];
-    [[BackgroundManager sharedManager] applyEffectToView:self.inviteField];
-
-    /* 玩家列表行：每行注入毛玻璃 */
-    for (UIView *row in self.playersList.arrangedSubviews) {
-        [[BackgroundManager sharedManager] applyEffectToView:row];
-    }
-
-    /* 文字颜色：背景图模式下用白字保证对比度；系统背景模式下用 labelColor */
-    BOOL hasBg = [[BackgroundManager sharedManager] hasBackground];
-    UIColor *primaryText = hasBg ? [UIColor whiteColor] : [UIColor labelColor];
-    UIColor *secondaryText = hasBg ? [UIColor colorWithWhite:1.0 alpha:0.8] : [UIColor secondaryLabelColor];
-    UIColor *tertiaryText = hasBg ? [UIColor colorWithWhite:1.0 alpha:0.7] : [UIColor tertiaryLabelColor];
-
-    self.statusLabel.textColor = primaryText;
-    self.stageLabel.textColor = secondaryText;
-    self.inviteCodeLabel.textColor = primaryText;
-    self.directConnectLabel.textColor = secondaryText;
-    self.createHintLabel.textColor = secondaryText;
-    self.joinHintLabel.textColor = secondaryText;
-    self.playersTitleLabel.textColor = primaryText;
-
-    /* 输入框文字颜色（占位符颜色由系统处理） */
-    self.portField.textColor = primaryText;
-    self.inviteField.textColor = primaryText;
-
-    /* 复制按钮：背景图模式下用白字 */
-    self.inviteCopyButton.tintColor = secondaryText;
-    self.directCopyButton.tintColor = secondaryText;
-
-    /* 断开连接按钮边框颜色（背景图模式下用更醒目的白色边框 + 半透明红底） */
-    if (hasBg) {
-        [self.disconnectButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        self.disconnectButton.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.6].CGColor;
-        self.disconnectButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
-    } else {
-        [self.disconnectButton setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
-        self.disconnectButton.layer.borderColor = [UIColor systemRedColor].CGColor;
-        self.disconnectButton.backgroundColor = [UIColor clearColor];
-    }
-}
-
-#pragma mark - UI Setup
-
-- (void)setupViews {
-    /* ScrollView 容器（小屏适配） */
+- (void)buildLayout {
     self.scrollView = [[UIScrollView alloc] init];
     self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
     self.scrollView.alwaysBounceVertical = YES;
     self.scrollView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
-    self.scrollView.backgroundColor = [UIColor clearColor];
     [self.view addSubview:self.scrollView];
 
-    self.contentView = [[UIView alloc] init];
-    self.contentView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.contentView.backgroundColor = [UIColor clearColor];
-    [self.scrollView addSubview:self.contentView];
+    self.rootStack = [[UIStackView alloc] init];
+    self.rootStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.rootStack.axis = UILayoutConstraintAxisVertical;
+    self.rootStack.spacing = kBlockSpacing;
+    self.rootStack.alignment = UIStackViewAlignmentFill;
+    [self.scrollView addSubview:self.rootStack];
 
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [self.scrollView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-        [self.scrollView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [self.scrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [self.scrollView.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
-        [self.contentView.topAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.topAnchor],
-        [self.contentView.leadingAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.leadingAnchor],
-        [self.contentView.trailingAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.trailingAnchor],
-        [self.contentView.bottomAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.bottomAnchor],
-        [self.contentView.widthAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.widthAnchor],
+        [self.scrollView.topAnchor      constraintEqualToAnchor:safe.topAnchor],
+        [self.scrollView.leadingAnchor  constraintEqualToAnchor:safe.leadingAnchor],
+        [self.scrollView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [self.scrollView.bottomAnchor   constraintEqualToAnchor:safe.bottomAnchor],
+
+        [self.rootStack.topAnchor      constraintEqualToAnchor:self.scrollView.contentLayoutGuide.topAnchor      constant:kContentInset],
+        [self.rootStack.bottomAnchor   constraintEqualToAnchor:self.scrollView.contentLayoutGuide.bottomAnchor   constant:-kContentInset],
+        [self.rootStack.leadingAnchor  constraintEqualToAnchor:self.scrollView.contentLayoutGuide.leadingAnchor  constant:kContentInset],
+        [self.rootStack.trailingAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.trailingAnchor constant:-kContentInset],
+        [self.rootStack.widthAnchor    constraintEqualToAnchor:self.scrollView.frameLayoutGuide.widthAnchor      constant:-(kContentInset * 2)],
     ]];
 
-    [self setupStatusCard];
-    [self setupTabControl];
-    [self setupCreatePanel];
-    [self setupJoinPanel];
-    [self setupSessionFooter];
+    [self buildStatusCard];
+    [self buildEntryCards];
+    [self buildCreateForm];
+    [self buildJoinForm];
+    [self buildConnectedSection];
+    [self buildFooter];
 }
 
-- (void)setupStatusCard {
+#pragma mark - 顶部状态卡
+
+- (void)buildStatusCard {
     self.statusCard = [[UIView alloc] init];
     self.statusCard.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusCard.backgroundColor = [UIColor clearColor];
-    self.statusCard.layer.cornerRadius = 16;
+    self.statusCard.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.statusCard.layer.cornerRadius = kCardCornerRadius;
     self.statusCard.layer.masksToBounds = YES;
-    [self.contentView addSubview:self.statusCard];
 
     self.statusIcon = [[UIImageView alloc] init];
     self.statusIcon.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusIcon.tintColor = [UIColor systemGrayColor];
     self.statusIcon.contentMode = UIViewContentModeScaleAspectFit;
-    [self.statusCard addSubview:self.statusIcon];
+    self.statusIcon.tintColor = [UIColor secondaryLabelColor];
 
-    self.activityIndicator = [[UIActivityIndicatorView alloc]
+    self.statusSpinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-    self.activityIndicator.translatesAutoresizingMaskIntoConstraints = NO;
-    self.activityIndicator.hidesWhenStopped = YES;
-    [self.statusCard addSubview:self.activityIndicator];
+    self.statusSpinner.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusSpinner.hidesWhenStopped = YES;
 
-    self.statusLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:18 weight:UIFontWeightSemibold]
-                                     textColor:[UIColor labelColor]];
-    [self.statusCard addSubview:self.statusLabel];
-
-    self.stageLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
-                                    textColor:[UIColor secondaryLabelColor]];
-    self.stageLabel.numberOfLines = 0;
-    [self.statusCard addSubview:self.stageLabel];
-
-    /* 邀请码行 */
-    self.inviteCodeLabel = [self makeLabelWithFont:[UIFont fontWithName:@"Menlo" size:14]
-                                        textColor:[UIColor labelColor]];
-    self.inviteCodeLabel.numberOfLines = 0;
-    [self.statusCard addSubview:self.inviteCodeLabel];
-
-    self.inviteCopyButton = [self makeCopyButtonWithSelector:@selector(copyInviteCode:)];
-    [self.statusCard addSubview:self.inviteCopyButton];
-
-    /* 直连地址行 */
-    self.directConnectLabel = [self makeLabelWithFont:[UIFont fontWithName:@"Menlo" size:13]
-                                          textColor:[UIColor secondaryLabelColor]];
-    self.directConnectLabel.numberOfLines = 0;
-    [self.statusCard addSubview:self.directConnectLabel];
-
-    self.directCopyButton = [self makeCopyButtonWithSelector:@selector(copyDirectURL:)];
-    [self.statusCard addSubview:self.directCopyButton];
-
+    // 图标/菊花二选一，用容器叠放以保持左列宽度稳定。
+    UIView *iconBox = [[UIView alloc] init];
+    iconBox.translatesAutoresizingMaskIntoConstraints = NO;
+    [iconBox addSubview:self.statusIcon];
+    [iconBox addSubview:self.statusSpinner];
     [NSLayoutConstraint activateConstraints:@[
-        [self.statusCard.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:16],
-        [self.statusCard.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.statusCard.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-
-        [self.statusIcon.topAnchor constraintEqualToAnchor:self.statusCard.topAnchor constant:16],
-        [self.statusIcon.leadingAnchor constraintEqualToAnchor:self.statusCard.leadingAnchor constant:16],
-        [self.statusIcon.widthAnchor constraintEqualToConstant:28],
-        [self.statusIcon.heightAnchor constraintEqualToConstant:28],
-
-        [self.activityIndicator.centerYAnchor constraintEqualToAnchor:self.statusIcon.centerYAnchor],
-        [self.activityIndicator.leadingAnchor constraintEqualToAnchor:self.statusIcon.trailingAnchor constant:8],
-
-        [self.statusLabel.centerYAnchor constraintEqualToAnchor:self.statusIcon.centerYAnchor],
-        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.activityIndicator.trailingAnchor constant:8],
-        [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-16],
-
-        [self.stageLabel.topAnchor constraintEqualToAnchor:self.statusIcon.bottomAnchor constant:8],
-        [self.stageLabel.leadingAnchor constraintEqualToAnchor:self.statusCard.leadingAnchor constant:16],
-        [self.stageLabel.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-16],
-
-        [self.inviteCodeLabel.topAnchor constraintEqualToAnchor:self.stageLabel.bottomAnchor constant:8],
-        [self.inviteCodeLabel.leadingAnchor constraintEqualToAnchor:self.statusCard.leadingAnchor constant:16],
-        [self.inviteCodeLabel.trailingAnchor constraintEqualToAnchor:self.inviteCopyButton.leadingAnchor constant:-8],
-
-        [self.inviteCopyButton.centerYAnchor constraintEqualToAnchor:self.inviteCodeLabel.centerYAnchor],
-        [self.inviteCopyButton.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-16],
-
-        [self.directConnectLabel.topAnchor constraintEqualToAnchor:self.inviteCodeLabel.bottomAnchor constant:4],
-        [self.directConnectLabel.leadingAnchor constraintEqualToAnchor:self.statusCard.leadingAnchor constant:16],
-        [self.directConnectLabel.trailingAnchor constraintEqualToAnchor:self.directCopyButton.leadingAnchor constant:-8],
-
-        [self.directCopyButton.centerYAnchor constraintEqualToAnchor:self.directConnectLabel.centerYAnchor],
-        [self.directCopyButton.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-16],
-
-        [self.statusCard.bottomAnchor constraintEqualToAnchor:self.directConnectLabel.bottomAnchor constant:16],
+        [iconBox.widthAnchor constraintEqualToConstant:28],
+        [iconBox.heightAnchor constraintEqualToConstant:28],
+        [self.statusIcon.centerXAnchor constraintEqualToAnchor:iconBox.centerXAnchor],
+        [self.statusIcon.centerYAnchor constraintEqualToAnchor:iconBox.centerYAnchor],
+        [self.statusIcon.widthAnchor constraintEqualToConstant:24],
+        [self.statusIcon.heightAnchor constraintEqualToConstant:24],
+        [self.statusSpinner.centerXAnchor constraintEqualToAnchor:iconBox.centerXAnchor],
+        [self.statusSpinner.centerYAnchor constraintEqualToAnchor:iconBox.centerYAnchor],
     ]];
-}
 
-- (void)setupTabControl {
-    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[localize(@"i18n_str_1008", nil), localize(@"i18n_str_1009", nil)]];
-    self.tabControl.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tabControl.selectedSegmentIndex = 0;
-    [self.tabControl addTarget:self action:@selector(tabChanged:)
-                 forControlEvents:UIControlEventValueChanged];
-    [self.contentView addSubview:self.tabControl];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [self.tabControl.topAnchor constraintEqualToAnchor:self.statusCard.bottomAnchor constant:16],
-        [self.tabControl.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.tabControl.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-        [self.tabControl.heightAnchor constraintEqualToConstant:32],
-    ]];
-}
-
-- (void)setupCreatePanel {
-    self.createPanel = [[UIView alloc] init];
-    self.createPanel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.createPanel.backgroundColor = [UIColor clearColor];
-    [self.contentView addSubview:self.createPanel];
-
-    self.createHintLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
-                                        textColor:[UIColor secondaryLabelColor]];
-    self.createHintLabel.numberOfLines = 0;
-    self.createHintLabel.text = localize(@"i18n_str_1010", nil);
-    [self.createPanel addSubview:self.createHintLabel];
-
-    self.portField = [self makeTextFieldWithPlaceholder:localize(@"i18n_str_1011", nil)
-                                            keyboardType:UIKeyboardTypeNumberPad];
-    self.portField.text = @"25565";
-    self.autoDetectedPortText = self.portField.text;   // ★ [PORT-AUTO] 默认值不算「用户手改」
-    self.portField.delegate = self;
-    [self.createPanel addSubview:self.portField];
-
-    self.createButton = [self makePrimaryButtonWithTitle:localize(@"i18n_str_1008", nil)
-                                                  action:@selector(createRoomTapped:)];
-    [self.createPanel addSubview:self.createButton];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [self.createPanel.topAnchor constraintEqualToAnchor:self.tabControl.bottomAnchor constant:16],
-        [self.createPanel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.createPanel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-
-        [self.createHintLabel.topAnchor constraintEqualToAnchor:self.createPanel.topAnchor],
-        [self.createHintLabel.leadingAnchor constraintEqualToAnchor:self.createPanel.leadingAnchor],
-        [self.createHintLabel.trailingAnchor constraintEqualToAnchor:self.createPanel.trailingAnchor],
-
-        [self.portField.topAnchor constraintEqualToAnchor:self.createHintLabel.bottomAnchor constant:8],
-        [self.portField.leadingAnchor constraintEqualToAnchor:self.createPanel.leadingAnchor],
-        [self.portField.trailingAnchor constraintEqualToAnchor:self.createPanel.trailingAnchor],
-        [self.portField.heightAnchor constraintEqualToConstant:44],
-
-        [self.createButton.topAnchor constraintEqualToAnchor:self.portField.bottomAnchor constant:12],
-        [self.createButton.leadingAnchor constraintEqualToAnchor:self.createPanel.leadingAnchor],
-        [self.createButton.trailingAnchor constraintEqualToAnchor:self.createPanel.trailingAnchor],
-        [self.createButton.heightAnchor constraintEqualToConstant:48],
-
-        [self.createPanel.bottomAnchor constraintEqualToAnchor:self.createButton.bottomAnchor],
-    ]];
-}
-
-- (void)setupJoinPanel {
-    self.joinPanel = [[UIView alloc] init];
-    self.joinPanel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.joinPanel.hidden = YES;
-    self.joinPanel.backgroundColor = [UIColor clearColor];
-    [self.contentView addSubview:self.joinPanel];
-
-    self.joinHintLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
-                                       textColor:[UIColor secondaryLabelColor]];
-    self.joinHintLabel.numberOfLines = 0;
-    self.joinHintLabel.text = localize(@"i18n_str_1012", nil);
-    [self.joinPanel addSubview:self.joinHintLabel];
-
-    self.inviteField = [self makeTextFieldWithPlaceholder:localize(@"i18n_str_1013", nil)
-                                              keyboardType:UIKeyboardTypeDefault];
-    self.inviteField.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.inviteField.autocorrectionType = UITextAutocorrectionTypeNo;
-    self.inviteField.delegate = self;
-    [self.joinPanel addSubview:self.inviteField];
-
-    self.joinButton = [self makePrimaryButtonWithTitle:localize(@"i18n_str_1009", nil)
-                                                 action:@selector(joinRoomTapped:)];
-    [self.joinPanel addSubview:self.joinButton];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [self.joinPanel.topAnchor constraintEqualToAnchor:self.tabControl.bottomAnchor constant:16],
-        [self.joinPanel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.joinPanel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-
-        [self.joinHintLabel.topAnchor constraintEqualToAnchor:self.joinPanel.topAnchor],
-        [self.joinHintLabel.leadingAnchor constraintEqualToAnchor:self.joinPanel.leadingAnchor],
-        [self.joinHintLabel.trailingAnchor constraintEqualToAnchor:self.joinPanel.trailingAnchor],
-
-        [self.inviteField.topAnchor constraintEqualToAnchor:self.joinHintLabel.bottomAnchor constant:8],
-        [self.inviteField.leadingAnchor constraintEqualToAnchor:self.joinPanel.leadingAnchor],
-        [self.inviteField.trailingAnchor constraintEqualToAnchor:self.joinPanel.trailingAnchor],
-        [self.inviteField.heightAnchor constraintEqualToConstant:44],
-
-        [self.joinButton.topAnchor constraintEqualToAnchor:self.inviteField.bottomAnchor constant:12],
-        [self.joinButton.leadingAnchor constraintEqualToAnchor:self.joinPanel.leadingAnchor],
-        [self.joinButton.trailingAnchor constraintEqualToAnchor:self.joinPanel.trailingAnchor],
-        [self.joinButton.heightAnchor constraintEqualToConstant:48],
-
-        [self.joinPanel.bottomAnchor constraintEqualToAnchor:self.joinButton.bottomAnchor],
-    ]];
-}
-
-- (void)setupSessionFooter {
-    self.playersTitleLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:15 weight:UIFontWeightSemibold]
+    self.statusTitleLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:17 weight:UIFontWeightSemibold]
                                           textColor:[UIColor labelColor]];
-    self.playersTitleLabel.text = localize(@"i18n_str_1014", nil);
-    [self.contentView addSubview:self.playersTitleLabel];
+    self.statusDetailLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
+                                           textColor:[UIColor secondaryLabelColor]];
+    self.statusDetailLabel.numberOfLines = 0;
 
-    self.playersList = [[UIStackView alloc] init];
-    self.playersList.translatesAutoresizingMaskIntoConstraints = NO;
-    self.playersList.axis = UILayoutConstraintAxisVertical;
-    self.playersList.spacing = 6;
-    self.playersList.alignment = UIStackViewAlignmentFill;
-    [self.contentView addSubview:self.playersList];
+    self.portLabel = [self makeLabelWithFont:[UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular]
+                                   textColor:[UIColor tertiaryLabelColor]];
+    self.portLabel.hidden = YES;
 
-    self.disconnectButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.disconnectButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.disconnectButton setTitle:localize(@"i18n_str_694", nil) forState:UIControlStateNormal];
-    [self.disconnectButton setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
-    self.disconnectButton.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    self.disconnectButton.layer.cornerRadius = 12;
-    self.disconnectButton.layer.borderWidth = 1;
-    self.disconnectButton.layer.borderColor = [UIColor systemRedColor].CGColor;
-    [self.disconnectButton addTarget:self action:@selector(disconnectTapped:)
-                    forControlEvents:UIControlEventTouchUpInside];
-    [self.contentView addSubview:self.disconnectButton];
+    UIStackView *textStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        self.statusTitleLabel, self.statusDetailLabel, self.portLabel,
+    ]];
+    textStack.translatesAutoresizingMaskIntoConstraints = NO;
+    textStack.axis = UILayoutConstraintAxisVertical;
+    textStack.spacing = 4;
+    textStack.alignment = UIStackViewAlignmentFill;
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[iconBox, textStack]];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 12;
+    row.alignment = UIStackViewAlignmentTop;
+    [self.statusCard addSubview:row];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.playersTitleLabel.topAnchor constraintEqualToAnchor:self.createPanel.bottomAnchor constant:20],
-        [self.playersTitleLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.playersTitleLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-
-        [self.playersList.topAnchor constraintEqualToAnchor:self.playersTitleLabel.bottomAnchor constant:8],
-        [self.playersList.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.playersList.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-
-        [self.disconnectButton.topAnchor constraintEqualToAnchor:self.playersList.bottomAnchor constant:16],
-        [self.disconnectButton.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
-        [self.disconnectButton.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-16],
-        [self.disconnectButton.heightAnchor constraintEqualToConstant:44],
-        [self.disconnectButton.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-16],
+        [row.topAnchor      constraintEqualToAnchor:self.statusCard.topAnchor      constant:kCardPadding],
+        [row.bottomAnchor   constraintEqualToAnchor:self.statusCard.bottomAnchor   constant:-kCardPadding],
+        [row.leadingAnchor  constraintEqualToAnchor:self.statusCard.leadingAnchor  constant:kCardPadding],
+        [row.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-kCardPadding],
     ]];
+
+    [self.rootStack addArrangedSubview:self.statusCard];
 }
 
-#pragma mark - UI Helpers
+#pragma mark - 未连接：两张入口卡片（ZL2 WaitingUI）
 
-- (UILabel *)makeLabelWithFont:(UIFont *)font textColor:(UIColor *)color {
-    UILabel *label = [[UILabel alloc] init];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.font = font;
-    label.textColor = color;
-    return label;
+- (void)buildEntryCards {
+    self.hostCard  = [self makeCardButtonWithIcon:@"house.fill"
+                                            title:localize(@"i18n_str_1008", nil)
+                                      description:localize(@"terracotta_host_desc", nil)
+                                           action:@selector(hostCardTapped)];
+    self.guestCard = [self makeCardButtonWithIcon:@"person.2.fill"
+                                            title:localize(@"i18n_str_1009", nil)
+                                      description:localize(@"terracotta_guest_desc", nil)
+                                           action:@selector(guestCardTapped)];
+
+    self.entryStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.hostCard, self.guestCard]];
+    self.entryStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.entryStack.axis = UILayoutConstraintAxisVertical;
+    self.entryStack.spacing = 12;
+    self.entryStack.alignment = UIStackViewAlignmentFill;
+    [self.rootStack addArrangedSubview:self.entryStack];
 }
 
-- (UITextField *)makeTextFieldWithPlaceholder:(NSString *)placeholder
-                                  keyboardType:(UIKeyboardType)keyboardType {
-    UITextField *field = [[UITextField alloc] init];
-    field.translatesAutoresizingMaskIntoConstraints = NO;
-    field.placeholder = placeholder;
-    field.borderStyle = UITextBorderStyleRoundedRect;
-    field.keyboardType = keyboardType;
-    field.font = [UIFont systemFontOfSize:16];
-    /* 背景透明：由 applyEffectToView: 注入毛玻璃 */
-    field.backgroundColor = [UIColor clearColor];
-    field.layer.cornerRadius = 8;
-    field.clipsToBounds = YES;
-    return field;
+#pragma mark - 创建房间表单
+
+- (void)buildCreateForm {
+    UILabel *hint = [self makeSectionHintLabel:localize(@"terracotta_port_hint", nil)];
+
+    self.portField = [self makeTextFieldWithPlaceholder:localize(@"terracotta_port_placeholder", nil)];
+    self.portField.keyboardType = UIKeyboardTypeNumberPad;
+    self.portField.textAlignment = NSTextAlignmentCenter;
+
+    self.portHintLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:12]
+                                       textColor:[UIColor tertiaryLabelColor]];
+    self.portHintLabel.textAlignment = NSTextAlignmentCenter;
+
+    UIButton *autoButton = [self makeSecondaryButtonWithTitle:localize(@"terracotta_port_auto", nil)
+                                                      action:@selector(autoDetectPortTapped)];
+    UIButton *startButton = [self makePrimaryButtonWithTitle:localize(@"terracotta_create_start", nil)
+                                                     action:@selector(createRoomTapped)];
+
+    self.createFormStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        hint, self.portField, self.portHintLabel, autoButton, startButton,
+    ]];
+    self.createFormStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.createFormStack.axis = UILayoutConstraintAxisVertical;
+    self.createFormStack.spacing = 10;
+    self.createFormStack.alignment = UIStackViewAlignmentFill;
+    [self.rootStack addArrangedSubview:self.createFormStack];
 }
 
-- (UIButton *)makePrimaryButtonWithTitle:(NSString *)title action:(SEL)action {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.translatesAutoresizingMaskIntoConstraints = NO;
-    [btn setTitle:title forState:UIControlStateNormal];
-    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-    btn.backgroundColor = accentColor();
-    btn.layer.cornerRadius = 12;
-    btn.layer.masksToBounds = YES;
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    return btn;
+#pragma mark - 加入房间表单
+
+- (void)buildJoinForm {
+    UILabel *hint = [self makeSectionHintLabel:localize(@"terracotta_join_hint", nil)];
+
+    self.codeField = [self makeTextFieldWithPlaceholder:localize(@"terracotta_code_placeholder", nil)];
+    self.codeField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.codeField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.codeField.textAlignment = NSTextAlignmentCenter;
+    self.codeField.delegate = self;
+    self.codeField.returnKeyType = UIReturnKeyJoin;
+
+    UIButton *pasteButton = [self makeSecondaryButtonWithTitle:localize(@"terracotta_paste", nil)
+                                                       action:@selector(pasteCodeTapped)];
+    UIButton *joinButton = [self makePrimaryButtonWithTitle:localize(@"terracotta_join_start", nil)
+                                                    action:@selector(joinRoomTapped)];
+
+    self.joinFormStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        hint, self.codeField, pasteButton, joinButton,
+    ]];
+    self.joinFormStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.joinFormStack.axis = UILayoutConstraintAxisVertical;
+    self.joinFormStack.spacing = 10;
+    self.joinFormStack.alignment = UIStackViewAlignmentFill;
+    [self.rootStack addArrangedSubview:self.joinFormStack];
 }
 
-- (UIButton *)makeCopyButtonWithSelector:(SEL)action {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImage *img = [UIImage systemImageNamed:@"doc.on.doc"];
-    [btn setImage:img forState:UIControlStateNormal];
-    btn.tintColor = [UIColor secondaryLabelColor];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    return btn;
+#pragma mark - 已连接：房间码 + 操作 + 玩家列表
+
+- (void)buildConnectedSection {
+    self.roomCodeLabel = [self makeLabelWithFont:[UIFont monospacedSystemFontOfSize:20 weight:UIFontWeightSemibold]
+                                       textColor:[UIColor labelColor]];
+    self.roomCodeLabel.textAlignment = NSTextAlignmentCenter;
+    self.roomCodeLabel.numberOfLines = 0;
+
+    UILabel *codeCaption = [self makeLabelWithFont:[UIFont systemFontOfSize:12]
+                                         textColor:[UIColor secondaryLabelColor]];
+    codeCaption.text = localize(@"terracotta_room_code", nil);
+    codeCaption.textAlignment = NSTextAlignmentCenter;
+
+    self.directURLLabel = [self makeLabelWithFont:[UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular]
+                                        textColor:[UIColor secondaryLabelColor]];
+    self.directURLLabel.textAlignment = NSTextAlignmentCenter;
+    self.directURLLabel.numberOfLines = 0;
+    self.directURLLabel.hidden = YES;
+
+    UIButton *copyCode = [self makeSecondaryButtonWithTitle:localize(@"terracotta_copy_code", nil)
+                                                    action:@selector(copyRoomCodeTapped)];
+    copyCode.hidden = YES;   // 由 refreshUI 按角色决定是否显示
+    self.roomCodeLabel.hidden = YES;
+    codeCaption.hidden = YES;
+    [self bindCopyCodeButton:copyCode];
+
+    UIButton *copyURL = [self makeSecondaryButtonWithTitle:localize(@"terracotta_copy_url", nil)
+                                                   action:@selector(copyDirectURLTapped)];
+    copyURL.hidden = YES;
+    [self bindCopyURLButton:copyURL];
+
+    // 玩家列表（标题 + 动态行）
+    UILabel *playersTitle = [self makeLabelWithFont:[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]
+                                          textColor:[UIColor secondaryLabelColor]];
+    playersTitle.text = localize(@"terracotta_player_list", nil);
+
+    self.playerListStack = [[UIStackView alloc] init];
+    self.playerListStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.playerListStack.axis = UILayoutConstraintAxisVertical;
+    self.playerListStack.spacing = 8;
+    self.playerListStack.alignment = UIStackViewAlignmentFill;
+
+    self.connectedStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        codeCaption, self.roomCodeLabel, self.directURLLabel,
+        copyCode, copyURL, playersTitle, self.playerListStack,
+    ]];
+    self.connectedStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.connectedStack.axis = UILayoutConstraintAxisVertical;
+    self.connectedStack.spacing = 10;
+    self.connectedStack.alignment = UIStackViewAlignmentFill;
+    [self.rootStack addArrangedSubview:self.connectedStack];
 }
 
-#pragma mark - Tab Switching
+#pragma mark - 底部
 
-- (void)tabChanged:(UISegmentedControl *)sender {
-    BOOL isCreate = (sender.selectedSegmentIndex == 0);
-    self.createPanel.hidden = !isCreate;
-    self.joinPanel.hidden = isCreate;
-    [self updatePortAutoDetection];   // ★ [PORT-AUTO] 仅在「创建房间」面板可见时探测
+- (void)buildFooter {
+    self.footerLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:11]
+                                     textColor:[UIColor tertiaryLabelColor]];
+    self.footerLabel.numberOfLines = 0;
+
+    self.logButton = [self makeFooterButtonWithTitle:localize(@"terracotta_log", nil)
+                                              action:@selector(logTapped)];
+    self.actionButton = [self makeFooterButtonWithTitle:localize(@"terracotta_back", nil)
+                                                 action:@selector(backTapped)];
+
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.logButton, self.actionButton]];
+    buttons.axis = UILayoutConstraintAxisHorizontal;
+    buttons.spacing = 16;
+    buttons.alignment = UIStackViewAlignmentCenter;
+
+    UIView *spacer = [[UIView alloc] init];
+    [spacer setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+    UIStackView *footer = [[UIStackView alloc] initWithArrangedSubviews:@[self.footerLabel, spacer, buttons]];
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+    footer.axis = UILayoutConstraintAxisHorizontal;
+    footer.spacing = 8;
+    footer.alignment = UIStackViewAlignmentCenter;
+    [self.rootStack addArrangedSubview:footer];
 }
 
-#pragma mark - Actions
+#pragma mark - 状态刷新（界面切换的唯一入口）
 
-- (void)createRoomTapped:(UIButton *)sender {
-    uint16_t port = (uint16_t)[self.portField.text integerValue];
-    if (port == 0) {
-        // ★ [PORT-AUTO] 未探测到且未手填：给一句明确提示（不写死值、不崩溃）
-        [self showToast:localize(@"i18n_str_1015", nil)];
+- (void)registerNotifications {
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(stateDidChange)
+                                                 name:TerracottaManagerStateDidChangeNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(backgroundEffectChanged)
+                                                 name:UIApplicationDidBecomeActiveNotification
+                                               object:nil];
+}
+
+- (void)backgroundEffectChanged {
+    [self refreshUI];
+}
+
+- (void)stateDidChange {
+    // 通知可能来自任意线程（Rust 轮询线程），UI 更新收敛到主线程。
+    if ([NSThread isMainThread]) {
+        [self refreshUI];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshUI]; });
+    }
+}
+
+- (void)refreshUI {
+    TerracottaManager *mgr = [TerracottaManager shared];
+    TerracottaStatus status = mgr.status;
+
+    // 顶部状态卡
+    self.statusTitleLabel.text = [self statusTitleForStatus:status role:mgr.role];
+    self.statusDetailLabel.text = mgr.stageDescription ?: [self statusDetailForStatus:status];
+
+    BOOL busy = (status == TerracottaStatusConnecting);
+    if (busy) {
+        self.statusIcon.hidden = YES;
+        [self.statusSpinner startAnimating];
+    } else {
+        [self.statusSpinner stopAnimating];
+        self.statusIcon.hidden = NO;
+        self.statusIcon.image = [UIImage systemImageNamed:[self statusIconNameForStatus:status]];
+        self.statusIcon.tintColor = [self statusColorForStatus:status];
+    }
+
+    if (mgr.currentPort > 0) {
+        self.portLabel.hidden = NO;
+        self.portLabel.text = [NSString stringWithFormat:localize(@"terracotta_port_fmt", nil),
+                               (unsigned)mgr.currentPort];
+    } else {
+        self.portLabel.hidden = YES;
+    }
+
+    // 分区块可见性：同一时刻只呈现一种状态对应的内容
+    BOOL showEntries   = (status == TerracottaStatusDisconnected);
+    BOOL showConnected = (status == TerracottaStatusConnected);
+    BOOL showError     = (status == TerracottaStatusError);
+
+    // 未连接时进一步区分：是否已展开某个表单
+    BOOL showCreate = showEntries && self.isHostRole;
+    BOOL showJoin   = showEntries && !self.isHostRole;
+
+    self.entryStack.hidden     = !(showEntries && self.manualPort == 0 && !self.hasExpandedForm);
+    self.createFormStack.hidden = !showCreate;
+    self.joinFormStack.hidden   = !showJoin;
+    self.connectedStack.hidden  = !showConnected;
+
+    // 已连接：房间码与玩家列表
+    if (showConnected) {
+        BOOL isHost = (mgr.role == TerracottaRoleHost);
+        NSString *code = mgr.currentInviteCode;
+        self.roomCodeLabel.hidden = (code.length == 0);
+        self.roomCodeLabel.text = code ?: @"";
+        NSArray<UIView *> *connectedViews = self.connectedStack.arrangedSubviews;
+        // [0]=codeCaption [1]=roomCode [2]=directURL [3]=copyCode [4]=copyURL
+        connectedViews[0].hidden = !isHost || code.length == 0;
+        ((UIButton *)connectedViews[3]).hidden = !isHost || code.length == 0;
+        self.directURLLabel.hidden = isHost || mgr.directConnectURL.length == 0;
+        self.directURLLabel.text = mgr.directConnectURL ?: @"";
+        ((UIButton *)connectedViews[4]).hidden = isHost || mgr.directConnectURL.length == 0;
+        [self refreshPlayerList];
+    }
+
+    // 错误态：借用状态卡呈现，并给出重试入口
+    if (showError) {
+        self.statusDetailLabel.text = mgr.lastError ?: localize(@"terracotta_error_unknown", nil);
+    }
+
+    // 底部
+    self.footerLabel.text = [self footerTextForStatus:status];
+    [self.actionButton setTitle:[self actionTitleForStatus:status] forState:UIControlStateNormal];
+    self.actionButton.hidden = (status == TerracottaStatusDisconnected && !self.hasExpandedForm);
+
+    [self.view setNeedsLayout];
+}
+
+- (BOOL)hasExpandedForm {
+    return self.createFormStack.hidden == NO || self.joinFormStack.hidden == NO;
+}
+
+#pragma mark - 玩家列表
+
+- (void)refreshPlayerList {
+    for (UIView *v in self.playerListStack.arrangedSubviews) {
+        [self.playerListStack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    NSArray<TerracottaPlayerProfile *> *players = [TerracottaManager shared].players;
+    if (players.count == 0) {
+        UILabel *empty = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
+                                       textColor:[UIColor tertiaryLabelColor]];
+        empty.text = localize(@"terracotta_no_players", nil);
+        [self.playerListStack addArrangedSubview:empty];
         return;
     }
-    [self.view endEditing:YES];
-    // ★ [PORT-AUTO] 用当前字段值创建（可能是自动探测填入，也可能是用户手改）
-    NSLog(@"[PORT-AUTO] create room using port=%u (autoDetected=%@)", port,
-          self.autoDetectedPortText ?: @"(nil)");
-    [self stopPortAutoDetection];   // 会话开始，停止探测
-    NSString *playerName = [self currentPlayerName];
-    [[TerracottaManager shared] createRoomWithPort:port
-                                        inviteCode:nil
-                                        playerName:playerName];
+    NSInteger selfIndex = [TerracottaManager shared].currentProfileIndex;
+    for (NSUInteger i = 0; i < players.count; i++) {
+        [self.playerListStack addArrangedSubview:[self makePlayerRow:players[i] isSelf:(i == (NSUInteger)selfIndex)]];
+    }
 }
 
-- (void)joinRoomTapped:(UIButton *)sender {
-    NSString *code = [self.inviteField.text stringByTrimmingCharactersInSet:
+- (UIView *)makePlayerRow:(TerracottaPlayerProfile *)profile isSelf:(BOOL)isSelf {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+    row.layer.cornerRadius = 10;
+    row.layer.masksToBounds = YES;
+
+    UILabel *name = [self makeLabelWithFont:[UIFont systemFontOfSize:14 weight:isSelf ? UIFontWeightSemibold : UIFontWeightRegular]
+                                  textColor:[UIColor labelColor]];
+    name.text = profile.name ?: @"?";
+    name.numberOfLines = 1;
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[name]];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisHorizontal;
+    stack.spacing = 8;
+    stack.alignment = UIStackViewAlignmentCenter;
+    [row addSubview:stack];
+
+    if (isSelf) {
+        UILabel *tag = [self makeLabelWithFont:[UIFont systemFontOfSize:11 weight:UIFontWeightMedium]
+                                     textColor:[UIColor systemBlueColor]];
+        tag.text = localize(@"terracotta_self_tag", nil);
+        [stack addArrangedSubview:tag];
+    }
+
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor      constraintEqualToAnchor:row.topAnchor      constant:10],
+        [stack.bottomAnchor   constraintEqualToAnchor:row.bottomAnchor   constant:-10],
+        [stack.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor  constant:12],
+        [stack.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor constant:-12],
+    ]];
+    return row;
+}
+
+#pragma mark - 动作
+
+- (void)hostCardTapped {
+    self.isHostRole = YES;
+    self.entryStack.hidden = YES;
+    self.createFormStack.hidden = NO;
+    self.joinFormStack.hidden = YES;
+    [self startPortAutoDetection];
+    self.actionButton.hidden = NO;
+    [self refreshUI];
+}
+
+- (void)guestCardTapped {
+    self.isHostRole = NO;
+    self.entryStack.hidden = YES;
+    self.createFormStack.hidden = YES;
+    self.joinFormStack.hidden = NO;
+    self.actionButton.hidden = NO;
+    [self refreshUI];
+}
+
+- (void)autoDetectPortTapped {
+    [self startPortAutoDetection];
+}
+
+- (void)createRoomTapped {
+    uint16_t port = self.manualPort;
+    if (port == 0) {
+        NSString *text = self.portField.text;
+        NSInteger parsed = text.integerValue;
+        if (parsed >= 1024 && parsed <= 65535) port = (uint16_t)parsed;
+    }
+    if (port == 0) {
+        [self showToast:localize(@"terracotta_port_invalid", nil)];
+        return;
+    }
+    [[TerracottaManager shared] createRoomWithPort:port inviteCode:nil playerName:self.resolvedPlayerName];
+    [self refreshUI];
+}
+
+- (void)joinRoomTapped {
+    NSString *code = [self.codeField.text stringByTrimmingCharactersInSet:
                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (code.length == 0) {
-        [self showToast:localize(@"i18n_str_1016", nil)];
+        [self showToast:localize(@"terracotta_code_empty", nil)];
         return;
     }
-    [self.view endEditing:YES];
-    NSString *playerName = [self currentPlayerName];
-    BOOL ok = [[TerracottaManager shared] joinRoomWithInviteCode:code
-                                                      playerName:playerName];
-    if (!ok) {
-        [self showToast:[[TerracottaManager shared] lastError] ?: localize(@"i18n_str_1017", nil)];
+    if (![[TerracottaManager shared] joinRoomWithInviteCode:code playerName:self.resolvedPlayerName]) {
+        [self showToast:localize(@"terracotta_code_invalid", nil)];
+        return;
     }
+    [self refreshUI];
 }
 
-- (void)disconnectTapped:(UIButton *)sender {
-    [[TerracottaManager shared] stopSession];
+- (void)pasteCodeTapped {
+    NSString *clip = UIPasteboard.generalPasteboard.string;
+    if (clip.length == 0) {
+        [self showToast:localize(@"terracotta_clipboard_empty", nil)];
+        return;
+    }
+    self.codeField.text = [clip stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
-- (void)copyInviteCode:(UIButton *)sender {
+- (void)copyRoomCodeTapped {
     NSString *code = [TerracottaManager shared].currentInviteCode;
     if (code.length == 0) return;
-    [UIPasteboard generalPasteboard].string = code;
-    [self showToast:localize(@"i18n_str_1018", nil)];
+    UIPasteboard.generalPasteboard.string = code;
+    [self showToast:localize(@"terracotta_copied", nil)];
 }
 
-- (void)copyDirectURL:(UIButton *)sender {
+- (void)copyDirectURLTapped {
     NSString *url = [TerracottaManager shared].directConnectURL;
     if (url.length == 0) return;
-    [UIPasteboard generalPasteboard].string = url;
-    [self showToast:localize(@"i18n_str_1019", nil)];
+    UIPasteboard.generalPasteboard.string = url;
+    [self showToast:localize(@"terracotta_copied", nil)];
+}
+
+- (void)logTapped {
+    // 联机日志由 TerracottaBridge 落到沙盒；这里直接展示最近若干行，
+    // 方便用户自查（ZL2 同样提供日志入口）。
+    [self presentLogViewer];
+}
+
+- (void)backTapped {
+    TerracottaStatus status = [TerracottaManager shared].status;
+    if (status == TerracottaStatusDisconnected) {
+        // 回到入口卡片
+        self.isHostRole = NO;
+        self.manualPort = 0;
+        self.entryStack.hidden = NO;
+        self.createFormStack.hidden = YES;
+        self.joinFormStack.hidden = YES;
+        self.actionButton.hidden = YES;
+        [self stopPortAutoDetection];
+        [self refreshUI];
+        return;
+    }
+    if (status == TerracottaStatusConnecting || status == TerracottaStatusConnected) {
+        [[TerracottaManager shared] stopSession];
+    }
+    [self close];
 }
 
 - (void)close {
-    /* 兼容两种容器：push 进 UINavigationController（启动器菜单路径）与 present 弹窗（游戏内菜单路径） */
-    if (self.navigationController && self.navigationController.viewControllers.firstObject != self) {
+    if (self.navigationController) {
         [self.navigationController popViewControllerAnimated:YES];
     } else {
         [self dismissViewControllerAnimated:YES completion:nil];
     }
 }
 
-/// 切换到 ZeroTier 联机界面（两个联机方案都保留，用户可自由切换）
-- (void)switchToZeroTier:(UIBarButtonItem *)sender {
-    /* 弹确认框，避免用户误触中断当前会话 */
-    TerracottaStatus status = [TerracottaManager shared].status;
-    if (status != TerracottaStatusDisconnected) {
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:localize(@"i18n_str_1020", nil)
-                              message:localize(@"i18n_str_1021", nil)
-                       preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
-        [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_1022", nil) style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-            [[TerracottaManager shared] stopSession];
-            [self presentZeroTierVC];
-        }]];
-        [self presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-    [self presentZeroTierVC];
+- (NSString *)resolvedPlayerName {
+    return self.playerName ?: [self currentPlayerName];
 }
-
-- (void)presentZeroTierVC {
-    MultiplayerViewController *vc = [[MultiplayerViewController alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    /* 如果当前是 push 进的 nav 栈，用 present 覆盖；如果是 modal，直接 present */
-    [self presentViewController:nav animated:YES completion:nil];
-}
-
-#pragma mark - Player Name
 
 - (NSString *)currentPlayerName {
-    /* 优先用启动器当前账户名，否则用设备名 */
-    NSString *name = getPrefObject(@"launcher.account_selected_name");
-    if (name.length > 0) return name;
-    return [UIDevice currentDevice].name ?: @"iOSPlayer";
+    NSString *name = getPrefObject(@"internal.last_username");
+    if ([name isKindOfClass:[NSString class]] && name.length > 0) return name;
+    return @"Player";
 }
 
-#pragma mark - UI Refresh
-
-- (void)registerNotifications {
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(stateDidChange:)
-                                                 name:TerracottaManagerStateDidChangeNotification
-                                               object:nil];
-    [self registerBackgroundNotifications];
-}
-
-- (void)stateDidChange:(NSNotification *)notification {
-    [self refreshUI];
-}
-
-- (void)refreshUI {
-    TerracottaManager *mgr = [TerracottaManager shared];
-
-    /* ★ [MP-ROLE] 角色标识：会话中把「我 · 房主 / 我 · 房客」放在状态标题；
-       阶段文案继续走现有 status 体系（statusDisplayText + stageDescription），不另造一套 */
-    NSString *roleTag = (mgr.status == TerracottaStatusError) ? nil : [self roleSelfTag:mgr.role];
-    NSString *statusText = [self statusDisplayText:mgr.status role:mgr.role];
-    self.statusLabel.text = roleTag.length ? roleTag : statusText;
-    self.statusIcon.image = [UIImage systemImageNamed:[self statusIconName:mgr.status]];
-    self.statusIcon.tintColor = [self statusColor:mgr.status];
-
-    /* 活动指示器 */
-    if (mgr.status == TerracottaStatusConnecting) {
-        [self.activityIndicator startAnimating];
-    } else {
-        [self.activityIndicator stopAnimating];
-    }
-
-    /* 阶段描述：角色标识占用标题后，阶段为空时用 status 文案兜底（仍是现有文案体系） */
-    NSString *stageText = mgr.stageDescription ?: @"";
-    if (roleTag.length && stageText.length == 0) stageText = statusText;
-    self.stageLabel.text = stageText;
-
-    /* 邀请码 */
-    if (mgr.currentInviteCode.length > 0) {
-        self.inviteCodeLabel.text = [NSString stringWithFormat:localize(@"i18n_str_1023", nil), mgr.currentInviteCode];
-        self.inviteCopyButton.hidden = NO;
-    } else {
-        self.inviteCodeLabel.text = nil;
-        self.inviteCopyButton.hidden = YES;
-    }
-
-    /* 直连地址 */
-    if (mgr.directConnectURL.length > 0) {
-        self.directConnectLabel.text = [NSString stringWithFormat:localize(@"i18n_str_1024", nil), mgr.directConnectURL];
-        self.directCopyButton.hidden = NO;
-    } else {
-        self.directConnectLabel.text = nil;
-        self.directCopyButton.hidden = YES;
-    }
-
-    /* 会话进行中：隐藏 Tab 和面板，显示断开按钮和玩家列表 */
-    BOOL sessionActive = (mgr.status != TerracottaStatusDisconnected);
-    self.tabControl.hidden = sessionActive;
-    self.createPanel.hidden = sessionActive ?: (self.tabControl.selectedSegmentIndex != 0);
-    self.joinPanel.hidden = sessionActive ?: (self.tabControl.selectedSegmentIndex != 1);
-    self.disconnectButton.hidden = !sessionActive;
-    self.playersTitleLabel.hidden = !sessionActive;
-
-    /* 玩家列表 */
-    [self refreshPlayersList:mgr.players role:mgr.role];
-
-    /* 错误提示（仅首次出现错误时弹 toast） */
-    if (mgr.status == TerracottaStatusError && mgr.lastError.length > 0) {
-        self.stageLabel.text = mgr.lastError;
-    }
-
-    [self updatePortAutoDetection];   // ★ [PORT-AUTO] 会话开始/结束会切换探测状态
-}
-
-- (void)refreshPlayersList:(NSArray<TerracottaPlayerProfile *> *)players
-                      role:(TerracottaRole)role {
-    /* 清空旧条目 */
-    for (UIView *v in self.playersList.arrangedSubviews) {
-        [self.playersList removeArrangedSubview:v];
-        [v removeFromSuperview];
-    }
-    if (players.count == 0) {
-        UILabel *empty = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
-                                       textColor:[UIColor tertiaryLabelColor]];
-        empty.text = (role == TerracottaRoleHost) ? localize(@"i18n_str_2045", nil) : localize(@"i18n_str_1026", nil);
-        [self.playersList addArrangedSubview:empty];
-        return;
-    }
-    // ★ [MP-ROLE] 本地玩家下标（来自 Rust 侧 profile_index）；越界/未知则不标「我」
-    NSInteger selfIdx = [TerracottaManager shared].currentProfileIndex;
-    for (NSInteger i = 0; i < (NSInteger)players.count; i++) {
-        TerracottaPlayerProfile *p = players[i];
-        BOOL isSelf = (selfIdx != NSNotFound && selfIdx == i);
-        [self.playersList addArrangedSubview:[self makePlayerRow:p role:role isSelf:isSelf]];
-    }
-    /* 新行也需要注入背景效果 */
-    for (UIView *row in self.playersList.arrangedSubviews) {
-        [[BackgroundManager sharedManager] applyEffectToView:row];
-    }
-}
-
-- (UIView *)makePlayerRow:(TerracottaPlayerProfile *)profile role:(TerracottaRole)role isSelf:(BOOL)isSelf {
-    UIView *row = [[UIView alloc] init];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-    row.backgroundColor = [UIColor clearColor];
-    row.layer.cornerRadius = 8;
-    row.layer.masksToBounds = YES;
-
-    UIImageView *avatar = [[UIImageView alloc] init];
-    avatar.translatesAutoresizingMaskIntoConstraints = NO;
-    avatar.image = [UIImage systemImageNamed:@"person.circle.fill"];
-    avatar.tintColor = accentColor();
-    [row addSubview:avatar];
-
-    UILabel *nameLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:15]
-                                      textColor:[UIColor labelColor]];
-    nameLabel.text = profile.name.length > 0 ? profile.name : @"(unknown)";
-    [row addSubview:nameLabel];
-
-    UILabel *roleLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:12]
-                                      textColor:[UIColor secondaryLabelColor]];
-    // ★ [MP-ROLE] 房主行标「房主」(playerRoleText 已按 kind 出)；自己那行标「我」；两者可叠加
-    NSString *roleText = [self playerRoleText:profile role:role];
-    if (isSelf) {
-        roleText = [NSString stringWithFormat:@"%@ · %@", TCLocalized(@"i18n_str_2068", @"我"), roleText];
-    }
-    roleLabel.text = roleText;
-    roleLabel.textAlignment = NSTextAlignmentRight;
-    [row addSubview:roleLabel];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [avatar.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12],
-        [avatar.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [avatar.widthAnchor constraintEqualToConstant:28],
-        [avatar.heightAnchor constraintEqualToConstant:28],
-
-        [nameLabel.leadingAnchor constraintEqualToAnchor:avatar.trailingAnchor constant:10],
-        [nameLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [nameLabel.trailingAnchor constraintEqualToAnchor:roleLabel.leadingAnchor constant:-8],
-
-        [roleLabel.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
-        [roleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [roleLabel.widthAnchor constraintGreaterThanOrEqualToConstant:60],
-
-        [row.heightAnchor constraintEqualToConstant:44],
-    ]];
-    return row;
-}
-
-- (NSString *)playerRoleText:(TerracottaPlayerProfile *)profile role:(TerracottaRole)myRole {
-    NSString *kind = profile.kind;
-    if ([kind isEqualToString:@"host"]) return localize(@"i18n_str_1027", nil);
-    if ([kind isEqualToString:@"guest"]) return localize(@"i18n_str_1028", nil);
-    /* 没有 kind 字段时用 profile_index == 0 推断房主 */
-    return localize(@"i18n_str_351", nil);
-}
-
-- (NSString *)statusDisplayText:(TerracottaStatus)status role:(TerracottaRole)role {
-    switch (status) {
-        case TerracottaStatusDisconnected: return localize(@"i18n_str_1029", nil);
-        case TerracottaStatusConnecting:
-            return (role == TerracottaRoleHost) ? localize(@"i18n_str_2046", nil) : localize(@"i18n_str_1031", nil);
-        case TerracottaStatusConnected:
-            return (role == TerracottaRoleHost) ? localize(@"i18n_str_2047", nil) : localize(@"i18n_str_1006", nil);
-        case TerracottaStatusError: return localize(@"i18n_str_1033", nil);
-    }
-    return @"";
-}
-
-- (NSString *)statusIconName:(TerracottaStatus)status {
-    switch (status) {
-        case TerracottaStatusDisconnected: return @"antenna.radiowaves.left.and.right.slash";
-        case TerracottaStatusConnecting: return @"arrow.triangle.2.circlepath";
-        case TerracottaStatusConnected: return @"antenna.radiowaves.left.and.right";
-        case TerracottaStatusError: return @"exclamationmark.triangle.fill";
-    }
-    return @"questionmark.circle";
-}
-
-- (UIColor *)statusColor:(TerracottaStatus)status {
-    switch (status) {
-        case TerracottaStatusDisconnected: return [UIColor systemGrayColor];
-        case TerracottaStatusConnecting: return [UIColor systemOrangeColor];
-        case TerracottaStatusConnected: return [UIColor systemGreenColor];
-        case TerracottaStatusError: return [UIColor systemRedColor];
-    }
-    return [UIColor systemGrayColor];
-}
-
-#pragma mark - ★ [MP-ROLE] 角色标识
-
-/// 会话角色 → 「我 · 房主」/「我 · 房客」；未进入会话返回 nil。
-- (NSString *)roleSelfTag:(TerracottaRole)role {
-    NSString *me = TCLocalized(@"i18n_str_2068", @"我");
-    if (role == TerracottaRoleHost) {
-        return [NSString stringWithFormat:@"%@ · %@", me, TCLocalized(@"i18n_str_1027", @"房主")];
-    }
-    if (role == TerracottaRoleClient) {
-        return [NSString stringWithFormat:@"%@ · %@", me, TCLocalized(@"i18n_str_2069", @"房客")];
-    }
-    return nil;
-}
-
-#pragma mark - ★ [PORT-AUTO] 局域网端口自动探测
-
-- (McLanPortDetector *)portDetector {
-    if (_portDetector == nil) _portDetector = [[McLanPortDetector alloc] init];
-    return _portDetector;
-}
-
-/// 仅当「创建房间」面板可见且当前未联机时探测；其余情况停止。
-- (void)updatePortAutoDetection {
-    TerracottaManager *mgr = [TerracottaManager shared];
-    BOOL visible = self.isViewLoaded && self.view.window != nil;
-    BOOL shouldRun = visible && !self.createPanel.hidden && mgr.status == TerracottaStatusDisconnected;
-    if (shouldRun) {
-        [self startPortAutoDetection];
-    } else {
-        [self stopPortAutoDetection];
-    }
-}
+#pragma mark - 端口自动检测
 
 - (void)startPortAutoDetection {
-    if (self.portDetector.polling) return;
-    NSString *gameDir = [McLanPortDetector resolveGameDirectoryWithInstanceName:getPrefObject(@"general.game_directory")];
+    // McLanPortDetector 的真实接口是「按游戏目录轮询」：
+    //   startPollingGameDirectory:launcherHome:handler:
+    // MC 的局域网端口由游戏自己随机开，启动器只能从日志里读出来，
+    // 因此这里是 1s 轮询而不是一次性探测。离开页面或会话开始时停掉。
+    [self stopPortAutoDetection];
+
+    NSString *instance = getPrefObject(@"general.game_directory");
+    if (![instance isKindOfClass:[NSString class]] || instance.length == 0) instance = nil;
+    NSString *gameDir = [McLanPortDetector resolveGameDirectoryWithInstanceName:instance];
     NSString *home = [McLanPortDetector launcherHome];
-    NSLog(@"[PORT-AUTO] begin auto-detect gameDir=%@ home=%@", gameDir ?: @"(nil)", home ?: @"(nil)");
+
+    self.portDetector = [[McLanPortDetector alloc] init];
+    self.portHintLabel.text = localize(@"i18n_str_1002", nil);
+
     __weak typeof(self) weakSelf = self;
-    [self.portDetector startPollingGameDirectory:gameDir launcherHome:home handler:^(uint16_t port) {
-        typeof(self) strongSelf = weakSelf;
-        if (strongSelf == nil) return;
-        [strongSelf applyAutoDetectedPort:port];
+    [self.portDetector startPollingGameDirectory:gameDir
+                                    launcherHome:home
+                                         handler:^(uint16_t port) {
+        typeof(self) self_ = weakSelf;
+        if (!self_ || port == 0) return;
+        // handler 已在主线程回调。
+        self_.manualPort = port;
+        self_.portAutoDetected = YES;
+        self_.portField.text = [NSString stringWithFormat:@"%u", (unsigned)port];
+        self_.portHintLabel.text = [NSString stringWithFormat:
+            localize(@"terracotta_port_detected", nil), (unsigned)port];
     }];
 }
 
 - (void)stopPortAutoDetection {
     [self.portDetector stopPolling];
+    self.portDetector = nil;
 }
 
-/// 把探测到的端口填入现有端口字段（尊重用户手改：字段被手改过则不覆盖）。
-- (void)applyAutoDetectedPort:(uint16_t)port {
-    if (self.view.window == nil) return;   // 已离开页面
-    NSString *text = [NSString stringWithFormat:@"%u", port];
-    BOOL userEdited = (self.portField.text.length > 0 &&
-                       ![self.portField.text isEqualToString:self.autoDetectedPortText ?: @""]);
-    if (userEdited) {
-        NSLog(@"[PORT-AUTO] detected=%u but port field user-edited (%@) -> keep", port, self.portField.text);
-        return;
+#pragma mark - UITextFieldDelegate
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    if (textField == self.codeField) {
+        [self joinRoomTapped];
+    } else {
+        [textField resignFirstResponder];
     }
-    self.autoDetectedPortText = text;
-    if ([self.portField.text isEqualToString:text]) {
-        NSLog(@"[PORT-AUTO] detected=%u (already in port field)", port);
-        return;
+    return YES;
+}
+
+#pragma mark - 文案与图标
+
+- (NSString *)statusTitleForStatus:(TerracottaStatus)status role:(TerracottaRole)role {
+    switch (status) {
+    case TerracottaStatusDisconnected:
+        return localize(@"terracotta_status_idle", nil);
+    case TerracottaStatusConnecting:
+        return (role == TerracottaRoleHost)
+            ? localize(@"i18n_str_1003", nil)
+            : localize(@"i18n_str_1000", nil);
+    case TerracottaStatusConnected:
+        return (role == TerracottaRoleHost)
+            ? localize(@"i18n_str_1004", nil)
+            : localize(@"i18n_str_1006", nil);
+    case TerracottaStatusError:
+        return localize(@"terracotta_status_error", nil);
     }
-    self.portField.text = text;
-    NSLog(@"[PORT-AUTO] auto-filled port field with %u", port);
-    [self showToast:[NSString stringWithFormat:TCLocalized(@"i18n_str_2070", @"已自动检测到局域网端口 %@"), text]];
+    return @"";
+}
+
+- (NSString *)statusDetailForStatus:(TerracottaStatus)status {
+    switch (status) {
+    case TerracottaStatusDisconnected:
+        return localize(@"terracotta_status_idle_desc", nil);
+    case TerracottaStatusConnecting:
+        return localize(@"terracotta_status_connecting_desc", nil);
+    case TerracottaStatusConnected:
+        return localize(@"terracotta_status_ok_desc", nil);
+    case TerracottaStatusError:
+        return localize(@"terracotta_status_error_desc", nil);
+    }
+    return @"";
+}
+
+- (NSString *)statusIconNameForStatus:(TerracottaStatus)status {
+    switch (status) {
+    case TerracottaStatusDisconnected: return @"network.slash";
+    case TerracottaStatusConnecting:   return @"arrow.triangle.2.circlepath";
+    case TerracottaStatusConnected:    return @"checkmark.circle.fill";
+    case TerracottaStatusError:        return @"exclamationmark.triangle.fill";
+    }
+    return @"network";
+}
+
+- (UIColor *)statusColorForStatus:(TerracottaStatus)status {
+    switch (status) {
+    case TerracottaStatusConnected: return [UIColor systemGreenColor];
+    case TerracottaStatusError:     return [UIColor systemRedColor];
+    case TerracottaStatusConnecting:return [UIColor systemOrangeColor];
+    default: return [UIColor secondaryLabelColor];
+    }
+}
+
+- (NSString *)actionTitleForStatus:(TerracottaStatus)status {
+    switch (status) {
+    case TerracottaStatusDisconnected: return localize(@"terracotta_back", nil);
+    case TerracottaStatusConnecting:   return localize(@"terracotta_cancel", nil);
+    case TerracottaStatusConnected:    return localize(@"terracotta_exit", nil);
+    case TerracottaStatusError:        return localize(@"terracotta_retry", nil);
+    }
+    return localize(@"terracotta_back", nil);
+}
+
+- (NSString *)footerTextForStatus:(TerracottaStatus)status {
+    TerracottaManager *mgr = [TerracottaManager shared];
+    if (status == TerracottaStatusConnected) {
+        return [NSString stringWithFormat:localize(@"terracotta_footer_connected", nil),
+                (unsigned long)mgr.players.count];
+    }
+    if (status == TerracottaStatusConnecting) {
+        return localize(@"terracotta_footer_connecting", nil);
+    }
+    return localize(@"terracotta_footer_idle", nil);
+}
+
+#pragma mark - 日志查看
+
+- (void)presentLogViewer {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:localize(@"terracotta_log", nil)
+                         message:[self recentLogText]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"generic_ok", nil)
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"terracotta_copy_log", nil)
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        UIPasteboard.generalPasteboard.string = [self recentLogText];
+        [self showToast:localize(@"terracotta_copied", nil)];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (NSString *)recentLogText {
+    // TerracottaBridge 把 Rust 侧日志写到沙盒 Documents 下的固定文件；
+    // 读取末尾若干行即可满足自助排查。
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject;
+    NSString *candidates[] = { @"terracotta.log", @"terracotta/terracotta.log" };
+    for (unsigned i = 0; i < 2; i++) {
+        NSString *path = [doc stringByAppendingPathComponent:candidates[i]];
+        NSString *content = [NSString stringWithContentsOfFile:path
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:NULL];
+        if (content.length > 0) {
+            NSArray<NSString *> *lines = [content componentsSeparatedByString:@"\n"];
+            NSUInteger tail = MIN((NSUInteger)40, lines.count);
+            return [[lines subarrayWithRange:NSMakeRange(lines.count - tail, tail)]
+                    componentsJoinedByString:@"\n"];
+        }
+    }
+    return localize(@"terracotta_log_empty", nil);
 }
 
 #pragma mark - Toast
 
-- (void)showToast:(NSString *)message {
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:nil
-                          message:message
-                   preferredStyle:UIAlertControllerStyleAlert];
+- (void)showToast:(NSString *)text {
+    if (text.length == 0) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:nil
+                                                                  message:text
+                                                           preferredStyle:UIAlertControllerStyleAlert];
     [self presentViewController:alert animated:YES completion:^{
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -952,11 +828,118 @@ static NSString *TCLocalized(NSString *key, NSString *fallback) {
     }];
 }
 
-#pragma mark - TextField Delegate
+#pragma mark - 控件工厂
 
-- (BOOL)textFieldShouldReturn:(UITextField *)textField {
-    [textField resignFirstResponder];
-    return YES;
+- (UILabel *)makeLabelWithFont:(UIFont *)font textColor:(UIColor *)color {
+    UILabel *l = [[UILabel alloc] init];
+    l.translatesAutoresizingMaskIntoConstraints = NO;
+    l.font = font;
+    l.textColor = color;
+    return l;
+}
+
+- (UILabel *)makeSectionHintLabel:(NSString *)text {
+    UILabel *l = [self makeLabelWithFont:[UIFont systemFontOfSize:12]
+                               textColor:[UIColor secondaryLabelColor]];
+    l.text = text;
+    l.numberOfLines = 0;
+    return l;
+}
+
+- (UITextField *)makeTextFieldWithPlaceholder:(NSString *)placeholder {
+    UITextField *f = [[UITextField alloc] init];
+    f.translatesAutoresizingMaskIntoConstraints = NO;
+    f.placeholder = placeholder;
+    f.borderStyle = UITextBorderStyleRoundedRect;
+    f.font = [UIFont monospacedSystemFontOfSize:15 weight:UIFontWeightRegular];
+    f.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    f.autocorrectionType = UITextAutocorrectionTypeNo;
+    f.clearButtonMode = UITextFieldViewModeWhileEditing;
+    return f;
+}
+
+- (UIButton *)makePrimaryButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    b.backgroundColor = [UIColor systemBlueColor];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.layer.cornerRadius = 12;
+    [b.heightAnchor constraintEqualToConstant:44].active = YES;
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UIButton *)makeSecondaryButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    b.backgroundColor = [UIColor tertiarySystemFillColor];
+    [b setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    b.layer.cornerRadius = 12;
+    [b.heightAnchor constraintEqualToConstant:40].active = YES;
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UIButton *)makeFooterButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+/// 入口大卡片：图标 + 标题 + 描述（ZL2 SimpleCardButton 的形态）。
+- (UIControl *)makeCardButtonWithIcon:(NSString *)iconName
+                                title:(NSString *)title
+                          description:(NSString *)desc
+                               action:(SEL)action {
+    UIControl *card = [[UIControl alloc] init];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    card.layer.cornerRadius = kCardCornerRadius;
+    card.layer.masksToBounds = YES;
+    [card addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:iconName]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = [UIColor systemBlueColor];
+    icon.contentMode = UIViewContentModeScaleAspectFit;
+
+    UILabel *titleLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:16 weight:UIFontWeightSemibold]
+                                        textColor:[UIColor labelColor]];
+    titleLabel.text = title;
+
+    UILabel *descLabel = [self makeLabelWithFont:[UIFont systemFontOfSize:13]
+                                       textColor:[UIColor secondaryLabelColor]];
+    descLabel.text = desc;
+    descLabel.numberOfLines = 0;
+
+    UIStackView *textStack = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, descLabel]];
+    textStack.axis = UILayoutConstraintAxisVertical;
+    textStack.spacing = 2;
+    textStack.alignment = UIStackViewAlignmentFill;
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[icon, textStack]];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 12;
+    row.alignment = UIStackViewAlignmentCenter;
+    [card addSubview:row];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.widthAnchor  constraintEqualToConstant:28],
+        [icon.heightAnchor constraintEqualToConstant:28],
+        [row.topAnchor      constraintEqualToAnchor:card.topAnchor      constant:kCardPadding],
+        [row.bottomAnchor   constraintEqualToAnchor:card.bottomAnchor   constant:-kCardPadding],
+        [row.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:kCardPadding],
+        [row.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-kCardPadding],
+    ]];
+    return card;
 }
 
 @end
