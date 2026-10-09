@@ -66,7 +66,7 @@ static BOOL ame227_g_dockedLeft = NO;
         self.userInteractionEnabled = YES;
         // 默认显示 FPS/内存标签（可通过菜单开关）
         _statsLabelVisible = YES;
-        _overlayHidden = NO;
+        _overlayHidden = YES;
 
         // 从偏好加载 FPS/内存显示开关状态
         NSNumber *savedVisible = getPrefObject(kPrefStatsLabelVisible);
